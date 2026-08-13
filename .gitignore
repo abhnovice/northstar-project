@@ -1,0 +1,8 @@
+.next
+node_modules
+data/*.db*
+__pycache__
+*.py[cod]
+static/ui
+.DS_Store
+*.log
