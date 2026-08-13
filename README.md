@@ -31,6 +31,24 @@ Interactive API documentation is available at [http://127.0.0.1:8000/docs](http:
 
 Vite proxies `/api` requests to FastAPI. Press `Ctrl+C` in the launcher terminal to stop both servers.
 
+## Deploy on Render
+
+Create a **Python 3 Web Service** and use these commands:
+
+```text
+Build Command: pip install -r requirements.txt
+Start Command: ./run_on_render.sh
+```
+
+`run_on_render.sh` starts the production FastAPI server on Render's `PORT` and
+serves the already-built React app from `static/ui`. It intentionally does not
+start the Vite development server.
+
+Northstar currently stores its data in `data/command-center.db`. Render's
+filesystem is ephemeral by default, so production changes will be lost after a
+restart or redeploy unless the service has a persistent disk mounted at
+`/opt/render/project/src/data`. Render persistent disks require a paid service.
+
 ## Tests
 
 ```bash
