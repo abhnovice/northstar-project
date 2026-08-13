@@ -1,6 +1,5 @@
 .next
 node_modules
-data/*.db*
 __pycache__
 *.py[cod]
 .DS_Store
