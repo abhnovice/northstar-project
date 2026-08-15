@@ -1,5 +1,8 @@
 import sqlite3
 import unittest
+import os
+
+os.environ["NORTHSTAR_DATABASE_URL"] = "sqlite"
 
 from fastapi import HTTPException
 
@@ -77,6 +80,40 @@ class CustomStudyMaterialTests(unittest.TestCase):
                     "url": "javascript:alert(1)",
                 },
             )
+
+    def test_full_catalogue_is_ranked_and_preference_is_opt_in(self):
+        task = dict(self.con.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.assignment["task_id"],)
+        ).fetchone())
+        task["resource_stages"] = [dict(self.assignment)]
+        catalogue = main.resource_catalogue(self.con)
+        options = main.task_resource_options(self.con, [task], catalogue)[
+            f"{task['id']}:{self.assignment['stage']}"
+        ]
+        self.assertEqual(len(options), len(catalogue))
+        self.assertTrue(next(item for item in options if item["available"])["recommended"])
+        enabled_alternative = next(
+            item for item in options
+            if item["available"] and item["id"] != self.assignment["resource_id"]
+        )
+
+        main.replace_task_resource(
+            self.con, self.assignment["id"], enabled_alternative["id"], False
+        )
+        preference = self.con.execute(
+            "SELECT * FROM topic_resource_preferences WHERE topic_id=? AND stage=?",
+            (task["topic_id"], self.assignment["stage"]),
+        ).fetchone()
+        self.assertIsNone(preference)
+
+        main.replace_task_resource(
+            self.con, self.assignment["id"], enabled_alternative["id"], True
+        )
+        preference = self.con.execute(
+            "SELECT * FROM topic_resource_preferences WHERE topic_id=? AND stage=?",
+            (task["topic_id"], self.assignment["stage"]),
+        ).fetchone()
+        self.assertEqual(preference["resource_id"], enabled_alternative["id"])
         with self.assertRaises(HTTPException):
             main.add_custom_study_material(
                 self.con,

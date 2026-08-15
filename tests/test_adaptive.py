@@ -1,5 +1,8 @@
 import sqlite3
 import unittest
+import os
+
+os.environ["NORTHSTAR_DATABASE_URL"] = "sqlite"
 
 import adaptive
 import main

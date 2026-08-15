@@ -1,8 +1,11 @@
 import unittest
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+
+os.environ["NORTHSTAR_DATABASE_URL"] = "sqlite"
 
 import main
 
@@ -105,7 +108,8 @@ class CommandCenterTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_replace_material_with_enabled_mapped_provider(self):
-        data = self.client.get("/api/app?date=2026-08-12").json()
+        selected_date = "2026-08-13"
+        data = self.client.get(f"/api/app?date={selected_date}").json()
         original_access = next(row for row in data["resourceAccess"] if row["resource_provider"] == "VARC1000")["enabled"]
         original_assignment_id = None
         original_resource_id = None
@@ -114,8 +118,8 @@ class CommandCenterTests(unittest.TestCase):
         try:
             if not original_access:
                 self.client.post("/api/app", json={"action":"setResourceAccess","payload":{"resource_provider":"VARC1000","enabled":True}})
-            enabled_data = self.client.get("/api/app?date=2026-08-12").json()
-            task = next(task for task in enabled_data["tasks"] if task["subject"] == "VARC" and task["resource_stages"])
+            enabled_data = self.client.get(f"/api/app?date={selected_date}").json()
+            task = next(task for task in enabled_data["tasks"] if task["date"] == selected_date and task["subject"] == "VARC" and task["resource_stages"])
             stage = next(stage for stage in task["resource_stages"] if stage["stage"] == "PRACTICE")
             original_assignment_id = stage["assignment_id"]
             original_resource_id = stage["resource_id"]
@@ -128,7 +132,7 @@ class CommandCenterTests(unittest.TestCase):
                 json={"action":"replaceTaskResource","payload":{"assignment_id":stage["assignment_id"],"resource_id":replacement["id"]}},
             )
             self.assertEqual(response.status_code, 200)
-            changed = self.client.get("/api/app?date=2026-08-12").json()
+            changed = self.client.get(f"/api/app?date={selected_date}").json()
             changed_task = next(item for item in changed["tasks"] if item["id"] == task["id"])
             changed_stage = next(item for item in changed_task["resource_stages"] if item["stage"] == "PRACTICE")
             self.assertEqual(changed_stage["resource_id"], replacement["id"])

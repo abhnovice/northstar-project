@@ -77,8 +77,8 @@ def resource_effectiveness(con: sqlite3.Connection) -> list[dict[str, Any]]:
                 JOIN study_resources sr ON sr.id=tra.resource_id
             )
             SELECT provider,COUNT(*) AS tasks,
-                   ROUND(AVG(accuracy),1) AS average_accuracy,
-                   ROUND(AVG(confidence),1) AS average_confidence
+                   ROUND(CAST(AVG(accuracy) AS NUMERIC),1) AS average_accuracy,
+                   ROUND(CAST(AVG(confidence) AS NUMERIC),1) AS average_confidence
             FROM provider_tasks
             GROUP BY provider
             ORDER BY tasks DESC,provider
@@ -138,7 +138,7 @@ def varc_analysis(con: sqlite3.Connection) -> dict[str, Any]:
         SELECT pattern FROM (
             SELECT error_type AS pattern,date AS occurred FROM errors WHERE subject='VARC'
             UNION ALL
-            SELECT tr.varc_error_pattern AS pattern,tr.completed_at AS occurred
+            SELECT tr.varc_error_pattern AS pattern,CAST(tr.completed_at AS TEXT) AS occurred
             FROM task_results tr JOIN tasks t ON t.id=tr.task_id
             WHERE t.subject='VARC' AND t.archived=0 AND tr.varc_error_pattern IS NOT NULL AND tr.varc_error_pattern!=''
         ) ORDER BY occurred DESC LIMIT 50

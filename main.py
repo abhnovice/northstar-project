@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
 import json
 import csv
 import io
+import sqlite3
 import uuid
-from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from database import connection, database_backend, database_health
 
 from aimcat import (
     decode_diagnosis,
@@ -52,19 +53,6 @@ app = FastAPI(title="Northstar MBA Prep OS", version="1.0.0")
 UI_DIR = ROOT / "static" / "ui"
 
 
-@contextmanager
-def connection():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield con
-        con.commit()
-    finally:
-        con.close()
-
-
 def phase_for(day: str) -> str:
     if day <= "2026-08-31": return "Foundation"
     if day <= "2026-09-27": return "Core syllabus + sectionals"
@@ -90,21 +78,43 @@ def should_mock(day: str, con: sqlite3.Connection | None = None) -> bool:
 
 
 def seed_aimcat_data(con: sqlite3.Connection):
+    schedules = []
     for test_ref, start_date, end_date in AIMCAT_WINDOWS:
         historical = int(end_date < PREP_START_DATE)
         preferred = preferred_attempt_date(start_date, end_date)
         planned = None if historical else preferred
-        con.execute(
-            """
-            INSERT OR IGNORE INTO aimcat_schedules(
-                provider,series,test_ref,start_date,end_date,preferred_attempt_date,
-                planned_attempt_date,status,historical
-            ) VALUES('TIME','AIMCAT',?,?,?,?,?,?,?)
-            """,
-            (test_ref, start_date, end_date, preferred, planned, "PAST" if historical else "UPCOMING", historical),
-        )
+        schedules.append((test_ref, start_date, end_date, preferred, planned, "PAST" if historical else "UPCOMING", historical))
+    con.executemany(
+        """
+        INSERT OR IGNORE INTO aimcat_schedules(
+            provider,series,test_ref,start_date,end_date,preferred_attempt_date,
+            planned_attempt_date,status,historical
+        ) VALUES('TIME','AIMCAT',?,?,?,?,?,?,?)
+        """,
+        schedules,
+    )
     con.execute(
         "INSERT INTO settings(key,value) VALUES('timePortalUrl','https://www.time4education.com/') ON CONFLICT(key) DO NOTHING"
+    )
+    resource_values = []
+    for schedule in con.execute("SELECT test_ref FROM aimcat_schedules").fetchall():
+        test_ref = str(schedule["test_ref"])
+        resource_values.append(
+            (
+                f"time-aimcat-{test_ref.lower()}", "TIME", test_ref,
+                "https://www.time4education.com/", f"T.I.M.E. student portal → AIMCAT → {test_ref}",
+                current_app_date().isoformat(), test_ref, f"AIMCAT {test_ref} TIME mock",
+            )
+        )
+    con.executemany(
+        """
+        INSERT OR IGNORE INTO study_resources(
+            id,provider,title,description,subject,type,url,platform_path,free,
+            requires_subscription,difficulty,active,last_verified_at,provider_title,
+            test_reference,category,tags,cat_priority,cat_core
+        ) VALUES(?,?,?,'Scheduled T.I.M.E. AIMCAT','QA','MOCK',?,?,0,1,'TIMED',1,?,'T.I.M.E.',?,'AIMCAT',?,'HIGH',1)
+        """,
+        resource_values,
     )
 
 
@@ -119,6 +129,33 @@ def seed_time_foundation_data(con: sqlite3.Connection):
     con.executemany(
         "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
         defaults.items(),
+    )
+    portal = row_map(con.execute("SELECT key,value FROM settings").fetchall()).get(
+        "timePortalUrl", "https://www.time4education.com/"
+    )
+    resource_values = []
+    for test in con.execute("SELECT * FROM time_foundation_tests ORDER BY id").fetchall():
+        resource_id = f"time-foundation-{test['test_reference'].lower()}"
+        topic = test["canonical_topic"] or test["canonical_topic_group"] or test["category"] or ""
+        resource_values.append(
+            (
+                resource_id, "TIME", test["provider_title"], test["subject"], str(topic).lower().replace("_", "-"),
+                portal, f"T.I.M.E. student portal → Foundation → {test['test_reference']}", current_app_date().isoformat(),
+                test["test_reference"], test["category"],
+                " ".join(filter(None, [test["canonical_topic"], test["canonical_topic_group"], test["category"], test["test_reference"]])).replace("_", " "),
+                test["cat_priority"], test["cat_core"],
+            )
+        )
+    con.executemany(
+        """
+        INSERT OR IGNORE INTO study_resources(
+            id,provider,title,description,subject,topic_slug,type,url,platform_path,
+            free,requires_subscription,estimated_minutes,difficulty,active,last_verified_at,
+            provider_title,test_reference,category,tags,cat_priority,cat_core
+        ) VALUES(?,?,?,'T.I.M.E. Foundation checkpoint',?,?,'FOUNDATION_TEST',?,?,0,1,45,
+                 'FOUNDATION',1,?,'T.I.M.E.',?,?,?,?,?)
+        """,
+        resource_values,
     )
 
 
@@ -438,7 +475,8 @@ def row_map(rows: list[sqlite3.Row]) -> dict[str, str]:
 def init_db():
     DATA.mkdir(exist_ok=True)
     with connection() as con:
-        con.executescript("""
+        if con.backend == "sqlite":
+            con.executescript("""
         CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS topics (id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, area TEXT, name TEXT, status TEXT DEFAULT 'Not Started', confidence INTEGER DEFAULT 1, accuracy REAL DEFAULT 0, attempted INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, avg_time REAL DEFAULT 0, last_practised TEXT, next_revision TEXT, importance INTEGER DEFAULT 3, source TEXT DEFAULT 'IMS module');
@@ -451,7 +489,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS day_reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT UNIQUE, actual_hours REAL, energy INTEGER, focus INTEGER, went_well TEXT, difficult TEXT, tomorrow TEXT);
         CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(date);
         """)
-        run_migrations(con)
+            run_migrations(con)
+        else:
+            run_postgres_migrations(con)
         if con.execute("SELECT COUNT(*) FROM profile").fetchone()[0]:
             migrate_schedule(con)
             seed_study_resource_data(con)
@@ -503,9 +543,18 @@ def init_db():
 
 def insert_task(con: sqlite3.Connection, row: dict[str, Any]) -> int:
     keys = list(row)
-    cursor = con.execute(f"INSERT INTO tasks({','.join(keys)}) VALUES({','.join('?' for _ in keys)})", tuple(row[k] for k in keys))
-    task_id = int(cursor.lastrowid)
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_resource_assignments'").fetchone():
+    backend = getattr(con, "backend", "sqlite")
+    returning = " RETURNING id" if backend == "postgresql" else ""
+    cursor = con.execute(
+        f"INSERT INTO tasks({','.join(keys)}) VALUES({','.join('?' for _ in keys)}){returning}",
+        tuple(row[k] for k in keys),
+    )
+    inserted = cursor.fetchone() if backend == "postgresql" else None
+    task_id = int(inserted["id"] if inserted else cursor.lastrowid)
+    assignments_exist = backend == "postgresql" or con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_resource_assignments'"
+    ).fetchone()
+    if assignments_exist:
         task_row = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         topic_row = resolve_task_topic(con, task_row)
         if topic_row:
@@ -561,6 +610,24 @@ def run_migrations(con: sqlite3.Connection):
             continue
         con.executescript(migration.read_text(encoding="utf-8"))
         con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (migration.stem,))
+
+
+def run_postgres_migrations(con):
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS postgres_schema_migrations (
+               version TEXT PRIMARY KEY,
+               applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+           )"""
+    )
+    applied = {row[0] for row in con.execute("SELECT version FROM postgres_schema_migrations")}
+    for migration in sorted((MIGRATIONS / "postgres").glob("*.sql")):
+        if migration.stem in applied:
+            continue
+        con.executescript(migration.read_text(encoding="utf-8"))
+        con.execute(
+            "INSERT INTO postgres_schema_migrations(version) VALUES(?) ON CONFLICT(version) DO NOTHING",
+            (migration.stem,),
+        )
 
 
 def initialize_plan_days(con: sqlite3.Connection):
@@ -694,11 +761,10 @@ def seed_study_resource_data(con: sqlite3.Connection):
         "recommended_question_count", "difficulty", "active", "last_verified_at",
     ]
     placeholders = ",".join("?" for _ in columns)
-    for item in STUDY_RESOURCES:
-        con.execute(
-            f"INSERT OR IGNORE INTO study_resources({','.join(columns)}) VALUES({placeholders})",
-            tuple(item[column] for column in columns),
-        )
+    con.executemany(
+        f"INSERT OR IGNORE INTO study_resources({','.join(columns)}) VALUES({placeholders})",
+        [tuple(item[column] for column in columns) for item in STUDY_RESOURCES],
+    )
     con.executemany(
         "INSERT OR IGNORE INTO user_resource_access(resource_provider,enabled,subscription_name,notes) VALUES(?,?,?,?)",
         USER_RESOURCE_ACCESS,
@@ -707,6 +773,17 @@ def seed_study_resource_data(con: sqlite3.Connection):
     con.executemany(
         "INSERT OR IGNORE INTO topic_resource_maps(topic_id,resource_id,purpose,priority,phase) VALUES(?,?,?,?,?)",
         mappings,
+    )
+    con.execute(
+        """
+        UPDATE study_resources SET
+            provider_title=CASE provider
+                WHEN 'TIME' THEN 'T.I.M.E.' WHEN 'CAT_PYQ' THEN 'CAT PYQ'
+                WHEN 'GMAC' THEN 'GMAC' WHEN 'CUSTOM' THEN 'My material'
+                ELSE provider END,
+            tags=TRIM(COALESCE(tags,'') || ' ' || provider || ' ' || subject || ' ' || type || ' ' || COALESCE(topic_slug,''))
+        WHERE provider_title=''
+        """
     )
 
 
@@ -812,8 +889,12 @@ def resource_candidates(
             FROM topic_resource_maps trm
             JOIN study_resources sr ON sr.id=trm.resource_id AND sr.active=1
             JOIN user_resource_access ura ON ura.resource_provider=sr.provider AND ura.enabled=1
+            LEFT JOIN topic_resource_preferences preference
+              ON preference.topic_id=trm.topic_id AND preference.stage=trm.purpose
             WHERE trm.topic_id=? AND trm.purpose=? AND trm.phase IN ('ALL', ?)
-            ORDER BY difficulty_rank,trm.priority,sr.free DESC,sr.title
+            ORDER BY CASE WHEN preference.resource_id=sr.id THEN 0
+                          WHEN preference.provider=sr.provider THEN 1 ELSE 2 END,
+                     difficulty_rank,trm.priority,sr.free DESC,sr.title
             """,
             (task_row["difficulty"], task_row["difficulty"], topic_row["id"], stage, phase_for(task_row["date"])),
         ).fetchall()
@@ -905,8 +986,13 @@ def assign_task_resources(con: sqlite3.Connection, task_id: int):
 
 def backfill_task_resources(con: sqlite3.Connection):
     """Idempotently attach material to existing tasks; no task or result data is replaced."""
-    for task_row in con.execute("SELECT id FROM tasks WHERE archived=0 ORDER BY id").fetchall():
-        assign_task_resources(con, int(task_row["id"]))
+    existing: dict[int, set[str]] = {}
+    for assignment in con.execute("SELECT task_id,stage FROM task_resource_assignments").fetchall():
+        existing.setdefault(int(assignment["task_id"]), set()).add(str(assignment["stage"]))
+    for task_row in con.execute("SELECT * FROM tasks WHERE archived=0 ORDER BY id").fetchall():
+        wanted = {stage for stage, _, _ in stage_plan(task_row)}
+        if wanted - existing.get(int(task_row["id"]), set()):
+            assign_task_resources(con, int(task_row["id"]))
 
 
 def refresh_disabled_assignments(con: sqlite3.Connection):
@@ -1024,7 +1110,7 @@ def recompute_topic_from_events(
     aggregate = con.execute(
         """
         SELECT SUM(attempted) attempted,SUM(correct) correct,SUM(time_spent) time_spent,
-               ROUND(AVG(confidence),0) confidence
+               ROUND(CAST(AVG(confidence) AS NUMERIC),0) confidence
         FROM topic_performance_events WHERE topic_id=?
         """,
         (topic_id,),
@@ -1379,16 +1465,19 @@ def record_time_foundation_result(con: sqlite3.Connection, payload: dict[str, An
     low = float(settings.get("timeFoundationContinueAccuracy", "70"))
     confidence_gate = int(settings.get("timeFoundationConfidence", "4"))
     outcome = "ADVANCE" if accuracy >= high and confidence >= confidence_gate else "CONTINUE" if accuracy >= low else "REPAIR"
+    backend = getattr(con, "backend", "sqlite")
+    returning = " RETURNING id" if backend == "postgresql" else ""
     cursor = con.execute(
         """
         INSERT INTO time_foundation_attempts(
             test_id,task_id,attempted_on,attempted,correct,accuracy,time_spent,confidence,notes,outcome
         ) VALUES(?,?,?,?,?,?,?,?,?,?)
-        """,
+        """ + returning,
         (test_id, task_id, attempted_on, attempted, correct, accuracy, time_spent,
          confidence, str(payload.get("notes", "")), outcome),
     )
-    attempt_id = int(cursor.lastrowid)
+    inserted = cursor.fetchone() if backend == "postgresql" else None
+    attempt_id = int(inserted["id"] if inserted else cursor.lastrowid)
     topic_row = topic_for_time_test(con, test_row, task_row)
     if topic_row:
         con.execute(
@@ -1757,9 +1846,9 @@ def enrich_tasks_with_resources(con: sqlite3.Connection, task_rows: list[dict[st
         SELECT tra.id AS assignment_id,tra.task_id,tra.stage,tra.stage_order,
                tra.estimated_minutes,tra.target_count,tra.accuracy_target,
                tra.selected_reason,tra.manual_override,tra.completed AS stage_completed,
-               sr.id AS resource_id,sr.provider,sr.title,sr.description,sr.subject AS resource_subject,
+               sr.id AS resource_id,sr.provider,sr.provider_title,sr.title,sr.description,sr.subject AS resource_subject,
                sr.type AS resource_type,sr.url,sr.platform_path,sr.free,
-               sr.requires_subscription,sr.difficulty
+               sr.requires_subscription,sr.difficulty,sr.test_reference,sr.category,sr.tags,sr.topic_slug
         FROM task_resource_assignments tra
         JOIN study_resources sr ON sr.id=tra.resource_id
         JOIN user_resource_access ura ON ura.resource_provider=sr.provider AND ura.enabled=1
@@ -1780,22 +1869,98 @@ def enrich_tasks_with_resources(con: sqlite3.Connection, task_rows: list[dict[st
         task_row["time_foundation_test"] = tests.get(task_row.get("time_foundation_test_id"))
 
 
-def task_resource_options(con: sqlite3.Connection, task_rows: list[dict[str, Any]]):
+def resource_catalogue(con) -> list[dict[str, Any]]:
+    catalogue = rows(
+        con,
+        """
+        SELECT sr.*,COALESCE(ura.enabled,0) AS available,
+               COALESCE(ura.subscription_name,'') AS subscription_name
+        FROM study_resources sr
+        LEFT JOIN user_resource_access ura ON ura.resource_provider=sr.provider
+        WHERE sr.active=1
+        ORDER BY sr.provider,sr.title
+        """,
+    )
+    mappings: dict[str, list[dict[str, Any]]] = {}
+    for mapping in rows(
+        con,
+        """SELECT map.resource_id,map.topic_id,map.purpose,map.priority,topic.name AS topic_name,
+                  topic.subject AS topic_subject
+           FROM topic_resource_maps map JOIN topics topic ON topic.id=map.topic_id
+           ORDER BY map.resource_id,map.priority""",
+    ):
+        mappings.setdefault(mapping["resource_id"], []).append(mapping)
+    for resource in catalogue:
+        resource["topic_mappings"] = mappings.get(resource["id"], [])
+    return catalogue
+
+
+def task_resource_options(
+    con,
+    task_rows: list[dict[str, Any]],
+    catalogue: list[dict[str, Any]] | None = None,
+):
+    all_resources = catalogue or resource_catalogue(con)
+    preferences = {
+        (int(item["topic_id"]), item["stage"]): item
+        for item in rows(con, "SELECT * FROM topic_resource_preferences")
+    }
     options: dict[str, list[dict[str, Any]]] = {}
     for task_row in task_rows:
+        assigned = {item["stage"]: item for item in task_row.get("resource_stages", [])}
         for stage, _, _ in stage_plan(task_row):
-            candidates = resource_candidates(con, task_row, stage)
-            if not candidates:
-                continue
-            options[f"{task_row['id']}:{stage}"] = [
-                {
-                    "id": item["id"], "provider": item["provider"], "title": item["title"],
-                    "url": item["url"], "platform_path": item["platform_path"],
-                    "type": item["type"], "free": item["free"],
-                    "requires_subscription": item["requires_subscription"],
+            current = assigned.get(stage)
+            preference = preferences.get((int(task_row.get("topic_id") or 0), stage))
+            ranked = []
+            for resource in all_resources:
+                exact_map = next(
+                    (
+                        mapping for mapping in resource["topic_mappings"]
+                        if mapping["topic_id"] == task_row.get("topic_id") and mapping["purpose"] == stage
+                    ),
+                    None,
+                )
+                subject = "QA" if task_row["subject"] == "Quant" else task_row["subject"]
+                subject_match = resource["subject"] in (subject, task_row["subject"])
+                priority = int(exact_map["priority"]) if exact_map else 999
+                cat_priority = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(resource.get("cat_priority"), 1)
+                score = (
+                    0 if exact_map else 1,
+                    0 if subject_match else 1,
+                    priority,
+                    0 if preference and preference["resource_id"] == resource["id"] else
+                    1 if preference and preference["provider"] == resource["provider"] else 2,
+                    cat_priority,
+                    0 if resource["available"] else 1,
+                    resource["provider"],
+                    resource["title"],
+                )
+                public_fields = {
+                    key: resource.get(key)
+                    for key in (
+                        "id", "provider", "provider_title", "title", "description", "subject",
+                        "topic_slug", "type", "url", "platform_path", "free",
+                        "requires_subscription", "difficulty", "available", "test_reference",
+                        "category", "tags", "cat_priority", "cat_core", "subscription_name",
+                    )
                 }
-                for item in candidates
-            ]
+                ranked.append(
+                    {
+                        **public_fields,
+                        "exact_topic_match": bool(exact_map),
+                        "subject_match": subject_match,
+                        "planner_score": priority,
+                        "recommended": False,
+                        "current": bool(current and current["resource_id"] == resource["id"]),
+                        "_score": score,
+                    }
+                )
+            ranked.sort(key=lambda item: item["_score"])
+            recommended = next((item for item in ranked if item["available"]), None)
+            for item in ranked:
+                item["recommended"] = bool(recommended and item["id"] == recommended["id"])
+                item.pop("_score", None)
+            options[f"{task_row['id']}:{stage}"] = ranked
     return options
 
 
@@ -1877,6 +2042,256 @@ def reschedule_task(con: sqlite3.Connection, task_id: int, to_date: str, to_star
     return {"task_ids": moved_ids, "grouped": bool(grouped), "date": to_date}
 
 
+def _movable_curriculum_task(con, task_row, completion_date: str, vacated_task) -> tuple[bool, str]:
+    """Enforce reallocation safety at the persistence boundary, not only in the UI."""
+    if not task_row or task_row["id"] == vacated_task["id"]:
+        return False, "same task"
+    if task_row["completed"] or task_row["archived"]:
+        return False, "already complete"
+    if task_row["manual"] or task_row["locked"] or task_row["pinned"]:
+        return False, "manual, locked or pinned"
+    if task_row["aimcat_schedule_id"] or task_row["kind"] not in ("practice", "revision", "sectional"):
+        return False, "fixed or mock-related"
+    if task_row["priority"] == "Critical":
+        return False, "critical"
+    if int(task_row["completion"] or 0) > 0 or int(task_row["actual_duration"] or 0) > 0:
+        return False, "already started"
+    if con.execute("SELECT 1 FROM task_results WHERE task_id=?", (task_row["id"],)).fetchone():
+        return False, "already started"
+    if task_row["date"] == vacated_task["date"]:
+        return False, "already occupies the target date"
+    # Moving a lesson away immediately before its next same-topic lesson can break ordering.
+    next_day = (date.fromisoformat(completion_date) + timedelta(days=1)).isoformat()
+    if task_row["topic_id"] and con.execute(
+        """SELECT 1 FROM tasks WHERE date=? AND topic_id=? AND completed=0 AND archived=0 AND id<>?""",
+        (next_day, task_row["topic_id"], task_row["id"]),
+    ).fetchone():
+        return False, "prerequisite for tomorrow"
+    duration_gap = abs(int(task_row["duration"] or 0) - int(vacated_task["duration"] or 0))
+    if duration_gap > max(30, round(int(vacated_task["duration"] or 0) * 0.5)):
+        return False, "duration mismatch"
+    return True, "eligible curriculum block"
+
+
+def _reallocation_candidates(con, completion_date: str, vacated_task) -> list[tuple[tuple[Any, ...], Any, str]]:
+    candidates: list[tuple[tuple[Any, ...], Any, str]] = []
+    priority_rank = {"High": 0, "Medium": 1, "Low": 2}
+    for candidate in con.execute(
+        """SELECT task.*,
+                  COALESCE(topic.importance,0) AS topic_importance,
+                  COALESCE(topic.mastery_score,0) AS topic_mastery,
+                  COALESCE((SELECT SUM(signal.weight) FROM adaptive_signals signal
+                            WHERE signal.topic_id=task.topic_id AND signal.resolved_at IS NULL),0) AS signal_weight
+           FROM tasks task LEFT JOIN topics topic ON topic.id=task.topic_id
+           WHERE task.completed=0 AND task.archived=0 AND task.date<=?
+           ORDER BY task.date,task.start_time,task.id""",
+        (vacated_task["date"],),
+    ).fetchall():
+        eligible, reason = _movable_curriculum_task(con, candidate, completion_date, vacated_task)
+        if not eligible:
+            continue
+        scheduled = date.fromisoformat(candidate["date"])
+        completed_on = date.fromisoformat(completion_date)
+        overdue_days = max(0, (completed_on - scheduled).days)
+        score = (
+            0 if candidate["date"] == completion_date else 1,
+            -overdue_days,
+            abs(int(candidate["duration"]) - int(vacated_task["duration"])),
+            priority_rank.get(candidate["priority"], 3),
+            -float(candidate["signal_weight"] or 0),
+            -int(candidate["topic_importance"] or 0),
+            float(candidate["topic_mastery"] or 0),
+            candidate["date"],
+            candidate["id"],
+        )
+        candidates.append((score, candidate, reason))
+    return sorted(candidates, key=lambda item: item[0])
+
+
+def complete_scheduled_topic_early(
+    con,
+    task_id: int,
+    completion_date: str,
+    completion_scope: str = "TASK",
+    reallocation_strategy: str = "AUTO",
+    replacement_task_id: int | None = None,
+) -> dict[str, Any]:
+    """Complete future curriculum work and safely reuse its original capacity."""
+    try:
+        completed_on = date.fromisoformat(completion_date)
+    except ValueError:
+        raise HTTPException(400, "Completion date must use YYYY-MM-DD format") from None
+    task_row = con.execute("SELECT * FROM tasks WHERE id=? AND archived=0", (task_id,)).fetchone()
+    if not task_row:
+        raise HTTPException(404, "Scheduled task not found")
+    if task_row["completed"]:
+        raise HTTPException(400, "This task is already complete")
+    if task_row["kind"] not in ("practice", "revision", "sectional") or task_row["aimcat_schedule_id"]:
+        raise HTTPException(400, "Only study or revision tasks can be completed early")
+    original_date = str(task_row["date"])
+    if completed_on > date.fromisoformat(original_date):
+        raise HTTPException(400, "Use the regular completion flow after the planned date")
+    scope = completion_scope.upper()
+    if scope not in ("TASK", "TOPIC"):
+        raise HTTPException(400, "Completion scope must be TASK or TOPIC")
+    strategy = reallocation_strategy.upper()
+    if strategy not in ("AUTO", "TODAY", "SPECIFIC", "NONE"):
+        raise HTTPException(400, "Unknown reallocation choice")
+
+    candidates = _reallocation_candidates(con, completion_date, task_row)
+    selected = None
+    selection_reason = "The future slot was intentionally left free"
+    if strategy == "SPECIFIC":
+        selected = con.execute("SELECT * FROM tasks WHERE id=?", (int(replacement_task_id or 0),)).fetchone()
+        eligible, reason = _movable_curriculum_task(con, selected, completion_date, task_row)
+        if not eligible:
+            raise HTTPException(400, f"That replacement task cannot move: {reason}")
+        selection_reason = "User selected another pending curriculum task"
+    elif strategy in ("AUTO", "TODAY"):
+        pool = [item for item in candidates if strategy != "TODAY" or item[1]["date"] == completion_date]
+        if pool:
+            _, selected, _ = pool[0]
+            selection_reason = (
+                "Moved the best comparable task scheduled today"
+                if selected["date"] == completion_date
+                else "Northstar selected the highest-priority comparable pending task"
+            )
+
+    con.execute(
+        """UPDATE tasks SET date=?,completed=1,completion=100,
+                  actual_duration=CASE WHEN actual_duration=0 THEN duration ELSE actual_duration END,
+                  completed_early=1,original_planned_date=COALESCE(original_planned_date,?),
+                  actual_completion_date=?,reallocated_task_id=?
+           WHERE id=?""",
+        (completion_date, original_date, completion_date, selected["id"] if selected else None, task_id),
+    )
+    con.execute(
+        "UPDATE task_resource_assignments SET completed=1,updated_at=CURRENT_TIMESTAMP WHERE task_id=?",
+        (task_id,),
+    )
+
+    if selected:
+        old_candidate_date = str(selected["date"])
+        con.execute(
+            """INSERT INTO task_reschedule_history(
+                   task_id,from_date,to_date,from_start_time,to_start_time,grouped
+               ) VALUES(?,?,?,?,?,0)""",
+            (selected["id"], old_candidate_date, original_date, selected["start_time"], task_row["start_time"]),
+        )
+        con.execute(
+            """UPDATE tasks SET date=?,start_time=?,rescheduled=1,
+                      reallocated_from_date=?,reallocated_to_date=?
+               WHERE id=?""",
+            (original_date, task_row["start_time"], old_candidate_date, original_date, selected["id"]),
+        )
+    else:
+        old_candidate_date = None
+
+    con.execute(
+        """INSERT INTO task_early_completion_history(
+               completed_task_id,replacement_task_id,completion_scope,completion_date,
+               original_planned_date,replacement_from_date,replacement_to_date,selection_reason
+           ) VALUES(?,?,?,?,?,?,?,?)""",
+        (task_id, selected["id"] if selected else None, scope, completion_date,
+         original_date, old_candidate_date, original_date if selected else None, selection_reason),
+    )
+
+    additional_completed: list[int] = []
+    if scope == "TOPIC" and task_row["topic_id"]:
+        # Only foundational curriculum is retired. Revisions and CAT/timed/mixed work remain useful.
+        foundation_rows = con.execute(
+            """SELECT id,date FROM tasks
+               WHERE topic_id=? AND id<>? AND completed=0 AND archived=0 AND manual=0
+                 AND kind='practice' AND difficulty IN ('FOUNDATION','INTERMEDIATE') AND date>=?""",
+            (task_row["topic_id"], task_id, completion_date),
+        ).fetchall()
+        for foundation in foundation_rows:
+            con.execute(
+                """UPDATE tasks SET completed=1,completion=100,completed_early=1,
+                          original_planned_date=COALESCE(original_planned_date,date),actual_completion_date=?
+                   WHERE id=?""",
+                (completion_date, foundation["id"]),
+            )
+            con.execute(
+                "UPDATE task_resource_assignments SET completed=1,updated_at=CURRENT_TIMESTAMP WHERE task_id=?",
+                (foundation["id"],),
+            )
+            con.execute(
+                """INSERT INTO task_early_completion_history(
+                       completed_task_id,completion_scope,completion_date,original_planned_date,selection_reason
+                   ) VALUES(?,'TOPIC',?,?,?)""",
+                (foundation["id"], completion_date, foundation["date"], "Foundation work covered by topic-level completion"),
+            )
+            additional_completed.append(int(foundation["id"]))
+        con.execute(
+            """UPDATE topics SET status='Strong',confidence=CASE WHEN confidence<4 THEN 4 ELSE confidence END,
+                      progression_level=CASE WHEN progression_level IN ('FOUNDATION','INTERMEDIATE') THEN 'CAT_LEVEL' ELSE progression_level END,
+                      mastery_score=CASE WHEN mastery_score<70 THEN 70 ELSE mastery_score END,
+                      last_practised=? WHERE id=?""",
+            (completion_date, task_row["topic_id"]),
+        )
+
+    return {
+        "completed_task_id": task_id,
+        "replacement_task_id": int(selected["id"]) if selected else None,
+        "additional_completed_task_ids": additional_completed,
+        "selection_reason": selection_reason,
+    }
+
+
+def replace_task_resource(
+    con,
+    assignment_id: int,
+    resource_id: str,
+    prefer_for_topic: bool = False,
+) -> None:
+    assignment = con.execute(
+        "SELECT * FROM task_resource_assignments WHERE id=?",
+        (assignment_id,),
+    ).fetchone()
+    if not assignment:
+        raise HTTPException(404, "Task material assignment not found")
+    candidate = con.execute(
+        """SELECT sr.* FROM study_resources sr
+           JOIN user_resource_access ura ON ura.resource_provider=sr.provider AND ura.enabled=1
+           WHERE sr.id=? AND sr.active=1""",
+        (resource_id,),
+    ).fetchone()
+    task_row = con.execute("SELECT * FROM tasks WHERE id=?", (assignment["task_id"],)).fetchone()
+    if not candidate:
+        raise HTTPException(400, "Replacement must be an enabled, available resource")
+    con.execute(
+        """UPDATE task_resource_assignments
+           SET resource_id=?,manual_override=1,selected_reason='Selected with Replace Material',updated_at=CURRENT_TIMESTAMP
+           WHERE id=?""",
+        (resource_id, assignment_id),
+    )
+    if candidate["type"] == "FOUNDATION_TEST" and candidate["test_reference"]:
+        checkpoint = con.execute(
+            "SELECT id FROM time_foundation_tests WHERE test_reference=? AND active=1",
+            (candidate["test_reference"],),
+        ).fetchone()
+        if checkpoint:
+            con.execute(
+                "UPDATE tasks SET time_foundation_test_id=? WHERE id=?",
+                (checkpoint["id"], task_row["id"]),
+            )
+    if prefer_for_topic and task_row["topic_id"]:
+        con.execute(
+            """INSERT INTO topic_resource_maps(topic_id,resource_id,purpose,priority,phase)
+               VALUES(?,?,?,1,'ALL')
+               ON CONFLICT(topic_id,resource_id,purpose,phase) DO UPDATE SET priority=1""",
+            (task_row["topic_id"], resource_id, assignment["stage"]),
+        )
+        con.execute(
+            """INSERT INTO topic_resource_preferences(topic_id,stage,resource_id,provider)
+               VALUES(?,?,?,?)
+               ON CONFLICT(topic_id,stage) DO UPDATE SET
+                   resource_id=excluded.resource_id,provider=excluded.provider,updated_at=CURRENT_TIMESTAMP""",
+            (task_row["topic_id"], assignment["stage"], resource_id, candidate["provider"]),
+        )
+
+
 def get_data(day: str) -> dict[str, Any]:
     with connection() as con:
         ensure_plan(con, day)
@@ -1890,10 +2305,14 @@ def get_data(day: str) -> dict[str, Any]:
         errors = rows(con, "SELECT * FROM errors ORDER BY date DESC,id DESC")
         aimcats, aimcat_meta, aimcat_trend = aimcat_payload(con, current_app_date().isoformat())
         enrich_tasks_with_resources(con, tasks)
+        catalogue = resource_catalogue(con)
         today_tasks = [x for x in tasks if x["date"] == day]
         due = sum(bool(x["next_revision"] and x["next_revision"] <= day) for x in topics)
         overdue_admin = sum(x["date"] >= PREP_START_DATE and x["date"] < day and not x["completed"] and x["kind"] not in ("practice","revision","mock","analysis") for x in tasks)
         missed_aimcats = sum(item["status"] == "MISSED" and not item["historical"] for item in aimcats)
+        reallocated_count = int(con.execute(
+            "SELECT COUNT(*) AS total FROM task_early_completion_history"
+        ).fetchone()["total"])
         health_load = overdue_admin + due + missed_aimcats * 3
         status = "Significantly behind" if health_load > 7 else "Slightly behind" if health_load > 2 else "On track"
         quant_left = sum(x["subject"] == "Quant" and x["area"] == "Arithmetic" and x["status"] == "Not Started" for x in topics)
@@ -1915,21 +2334,25 @@ def get_data(day: str) -> dict[str, Any]:
             "aimcatMeta": aimcat_meta, "aimcatTrend": aimcat_trend, "errors": errors,
             "resources": rows(con, "SELECT * FROM resources ORDER BY recommended DESC,id"),
             "studyResources": rows(con, "SELECT * FROM study_resources ORDER BY free DESC,provider,title"),
+            "resourceCatalogue": catalogue,
             "resourceAccess": rows(con, "SELECT * FROM user_resource_access ORDER BY enabled DESC,resource_provider"),
             "topicResourceMaps": rows(con, "SELECT * FROM topic_resource_maps ORDER BY topic_id,purpose,priority"),
             "timeFoundationTests": time_foundation_payload(con),
-            "taskResourceOptions": task_resource_options(con, tasks), "revisionSchedule": revisions,
+            # Replace Material is opened from the selected day's plan; avoid repeating the
+            # full catalogue for every future task in the application payload.
+            "taskResourceOptions": task_resource_options(con, today_tasks, catalogue), "revisionSchedule": revisions,
             "dilrPerformance": dilr_performance(con), "varcAnalysis": varc_analysis(con),
             "resourceEffectiveness": resource_effectiveness(con), "resourceCoverage": coverage_report(con),
             "adaptiveSignals": rows(con, "SELECT signal.*,topic.name AS topic,topic.subject FROM adaptive_signals signal JOIN topics topic ON topic.id=signal.topic_id WHERE signal.resolved_at IS NULL ORDER BY signal.weight DESC"),
             "stories": rows(con, "SELECT * FROM stories ORDER BY id DESC"),
             "reviews": rows(con, "SELECT * FROM day_reviews ORDER BY date DESC"),
+            "system": {"database": {"engine": "PostgreSQL" if con.backend == "postgresql" else "SQLite", "status": "Connected"}},
             "meta": {
                 "today": day, "phase": phase_for(day), "countdown": (EXAM_DATE-now).days,
                 "workMonths": work_months, "plannedMinutes": sum(x["duration"] for x in today_tasks),
                 "completedMinutes": sum((x["actual_duration"] or x["duration"]) if x["completed"] else round(x["duration"]*x["completion"]/100) for x in today_tasks),
-                "behind": {"label": status, "detail": f"{quant_left} Arithmetic blocks remain unstarted; {due} revisions are due; {missed_aimcats} scheduled AIMCATs missed."},
-                "nextMock": next_mock, "revisionDue": due,
+                "behind": {"label": status, "detail": f"{quant_left} Arithmetic blocks remain unstarted; {due} revisions are due; {missed_aimcats} scheduled AIMCATs missed; {reallocated_count} early-completion slot(s) audited."},
+                "nextMock": next_mock, "revisionDue": due, "reallocated": reallocated_count,
             },
         }
 
@@ -1949,6 +2372,11 @@ def home():
 @app.get("/api/app")
 def api_data(day: str | None = Query(None, alias="date")):
     return get_data(day or current_app_date().isoformat())
+
+
+@app.get("/api/health/database")
+def api_database_health():
+    return database_health()
 
 
 @app.post("/api/app")
@@ -2061,33 +2489,11 @@ def api_action(body: Action):
                         (current_app_date().isoformat(),),
                     )
         elif action == "replaceTaskResource":
-            assignment_id = int(p.get("assignment_id", 0))
-            resource_id = str(p.get("resource_id", ""))
-            assignment = con.execute(
-                "SELECT * FROM task_resource_assignments WHERE id=?",
-                (assignment_id,),
-            ).fetchone()
-            if not assignment:
-                raise HTTPException(404, "Task material assignment not found")
-            candidate = con.execute(
-                """
-                SELECT sr.id FROM study_resources sr
-                JOIN user_resource_access ura ON ura.resource_provider=sr.provider AND ura.enabled=1
-                WHERE sr.id=? AND sr.active=1
-                """,
-                (resource_id,),
-            ).fetchone()
-            task_row = con.execute("SELECT * FROM tasks WHERE id=?", (assignment["task_id"],)).fetchone()
-            allowed = {item["id"] for item in resource_candidates(con, task_row, assignment["stage"])}
-            if not candidate or resource_id not in allowed:
-                raise HTTPException(400, "Replacement must be an enabled resource mapped to this task stage")
-            con.execute(
-                """
-                UPDATE task_resource_assignments
-                SET resource_id=?,manual_override=1,selected_reason='Selected with Replace Material',updated_at=CURRENT_TIMESTAMP
-                WHERE id=?
-                """,
-                (resource_id, assignment_id),
+            replace_task_resource(
+                con,
+                int(p.get("assignment_id", 0)),
+                str(p.get("resource_id", "")),
+                bool(p.get("prefer_for_topic")),
             )
         elif action == "rescheduleTask":
             selected = con.execute("SELECT * FROM tasks WHERE id=? AND archived=0", (int(p.get("task_id", 0)),)).fetchone()
@@ -2100,6 +2506,15 @@ def api_action(body: Action):
                     str(p.get("date", "")),
                     str(p.get("start_time", "")),
                 )
+        elif action == "completeScheduledTopicEarly":
+            complete_scheduled_topic_early(
+                con,
+                int(p.get("task_id", 0)),
+                str(p.get("completion_date") or current_app_date().isoformat()),
+                str(p.get("completion_scope", "TASK")),
+                str(p.get("reallocation_strategy", "AUTO")),
+                int(p.get("replacement_task_id", 0)) or None,
+            )
         elif action == "completeTaskWithResult":
             task_id = int(p.get("task_id", 0))
             attempted = int(p.get("attempted", 0))
@@ -2172,8 +2587,14 @@ def api_action(body: Action):
 
 def insert_named(con, table, payload, keys):
     values=[payload.get(k, 0 if k.endswith(("score","percentile","attempts","correct","missed","errors")) else "") for k in keys]
-    cursor = con.execute(f"INSERT INTO {table}({','.join(keys)}) VALUES({','.join('?' for _ in keys)})",values)
-    return int(cursor.lastrowid)
+    backend = getattr(con, "backend", "sqlite")
+    returning = " RETURNING id" if backend == "postgresql" else ""
+    cursor = con.execute(
+        f"INSERT INTO {table}({','.join(keys)}) VALUES({','.join('?' for _ in keys)}){returning}",
+        values,
+    )
+    inserted = cursor.fetchone() if backend == "postgresql" else None
+    return int(inserted["id"] if inserted else cursor.lastrowid)
 
 
 init_db()

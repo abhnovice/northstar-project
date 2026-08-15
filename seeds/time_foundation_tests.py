@@ -55,13 +55,15 @@ TIME_FOUNDATION_TESTS = [
 
 
 def seed_time_foundation_tests(connection):
-    for reference, title, subject, category, group, topic, priority in TIME_FOUNDATION_TESTS:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO time_foundation_tests(
-                test_reference,provider_title,subject,level,category,
-                canonical_topic_group,canonical_topic,cat_priority,cat_core
-            ) VALUES(?,?,?,'FOUNDATION',?,?,?,?,?)
-            """,
-            (reference, title, subject, category, group, topic, priority, int(priority != "LOW")),
-        )
+    connection.executemany(
+        """
+        INSERT OR IGNORE INTO time_foundation_tests(
+            test_reference,provider_title,subject,level,category,
+            canonical_topic_group,canonical_topic,cat_priority,cat_core
+        ) VALUES(?,?,?,'FOUNDATION',?,?,?,?,?)
+        """,
+        [
+            (reference, title, subject, category, group, topic, priority, int(priority != "LOW"))
+            for reference, title, subject, category, group, topic, priority in TIME_FOUNDATION_TESTS
+        ],
+    )
