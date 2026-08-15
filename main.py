@@ -37,7 +37,7 @@ from adaptive import (
 )
 from seeds.resource_catalog import STUDY_RESOURCES, USER_RESOURCE_ACCESS
 from seeds.aimcat_schedule import AIMCAT_WINDOWS
-from seeds.time_foundation_tests import seed_time_foundation_tests
+from seeds.time_foundation_tests import TIME_FOUNDATION_INVENTORY, seed_time_foundation_tests
 from seeds.topic_resource_mappings import build_topic_mappings
 
 ROOT = Path(__file__).parent
@@ -290,6 +290,141 @@ def attach_time_foundation_checkpoint(con: sqlite3.Connection, day: str, planned
     block["adaptive_reason"] = f"{block.get('adaptive_reason')} · {reason}" if block.get("adaptive_reason") else reason
 
 
+def foundation_subject_block(subject: str) -> str:
+    return "Quant" if subject == "QA" else "VARC" if subject == "VARC" else "DILR"
+
+
+def initialize_time_foundation_schedule(con) -> None:
+    """Place each known portal reference inside one existing nightly subject block."""
+    # Preserve any checkpoint already attached before the inventory schedule existed.
+    con.execute(
+        """INSERT INTO time_foundation_schedule(test_id,planned_date,task_id,status,selection_reason)
+           SELECT task.time_foundation_test_id,task.date,task.id,
+                  CASE WHEN EXISTS(
+                      SELECT 1 FROM time_foundation_attempts attempt
+                      WHERE attempt.test_id=task.time_foundation_test_id
+                  ) THEN 'COMPLETED' ELSE 'PLANNED' END,
+                  'Preserved existing T.I.M.E. checkpoint'
+           FROM tasks task
+           WHERE task.time_foundation_test_id IS NOT NULL AND task.archived=0
+           ON CONFLICT(test_id) DO NOTHING"""
+    )
+    already_planned = {
+        int(row["test_id"])
+        for row in con.execute("SELECT test_id FROM time_foundation_schedule").fetchall()
+    }
+    tests = con.execute(
+        """SELECT test.* FROM time_foundation_tests test
+           WHERE test.active=1 AND NOT EXISTS(
+               SELECT 1 FROM time_foundation_attempts attempt WHERE attempt.test_id=test.id
+           )
+           ORDER BY test.cat_core DESC,
+                    CASE test.cat_priority WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
+                    test.id"""
+    ).fetchall()
+    queues: dict[str, list[Any]] = {"Quant": [], "DILR": [], "VARC": []}
+    for test in tests:
+        if int(test["id"]) not in already_planned:
+            queues[foundation_subject_block(test["subject"])].append(test)
+    ordered: list[Any] = []
+    while any(queues.values()):
+        for subject in ("Quant", "DILR", "VARC"):
+            if queues[subject]:
+                ordered.append(queues[subject].pop(0))
+
+    occupied_dates = {
+        row["planned_date"]
+        for row in con.execute(
+            "SELECT planned_date FROM time_foundation_schedule WHERE status='PLANNED'"
+        ).fetchall()
+    }
+    start = max(current_app_date(), date.fromisoformat(PREP_START_DATE))
+    end = date(2026, 11, 18)
+    available_dates = []
+    cursor = start
+    while cursor <= end:
+        day = cursor.isoformat()
+        if day not in occupied_dates and not should_mock(day, con):
+            available_dates.append(day)
+        cursor += timedelta(days=1)
+    for test, planned_date in zip(ordered, available_dates):
+        con.execute(
+            """INSERT INTO time_foundation_schedule(
+                   test_id,planned_date,selection_reason
+               ) VALUES(?,?,?) ON CONFLICT(test_id) DO NOTHING""",
+            (
+                test["id"], planned_date,
+                "Known T.I.M.E. inventory · 45 minutes inside the existing nightly block",
+            ),
+        )
+
+
+def attach_scheduled_foundation_test(con, day: str) -> None:
+    scheduled = con.execute(
+        """SELECT schedule.*,test.subject,test.test_reference,test.cat_priority
+           FROM time_foundation_schedule schedule
+           JOIN time_foundation_tests test ON test.id=schedule.test_id
+           WHERE schedule.planned_date=? AND schedule.status='PLANNED'
+           ORDER BY schedule.id LIMIT 1""",
+        (day,),
+    ).fetchone()
+    if not scheduled:
+        return
+    subject = foundation_subject_block(scheduled["subject"])
+    linked = con.execute(
+        "SELECT * FROM tasks WHERE id=? AND archived=0",
+        (scheduled["task_id"],),
+    ).fetchone() if scheduled["task_id"] else None
+    if linked and linked["date"] == day and linked["time_foundation_test_id"] == scheduled["test_id"]:
+        assignment_summary = con.execute(
+            """SELECT COALESCE(SUM(estimated_minutes),0) AS total,
+                      COALESCE(MAX(manual_override),0) AS has_manual
+               FROM task_resource_assignments WHERE task_id=?""",
+            (linked["id"],),
+        ).fetchone()
+        available_minutes = max(30, int(linked["duration"]) - 45)
+        if not assignment_summary["has_manual"] and assignment_summary["total"] > available_minutes:
+            con.execute(
+                "DELETE FROM task_resource_assignments WHERE task_id=? AND manual_override=0",
+                (linked["id"],),
+            )
+            assign_task_resources(con, int(linked["id"]))
+        return
+    candidate = con.execute(
+        """SELECT task.* FROM tasks task
+           WHERE task.date=? AND task.subject=? AND task.kind='practice'
+             AND task.manual=0 AND task.archived=0 AND task.completed=0
+             AND task.rescheduled=0
+             AND NOT EXISTS (SELECT 1 FROM task_results result WHERE result.task_id=task.id)
+           ORDER BY task.start_time,task.id LIMIT 1""",
+        (day, subject),
+    ).fetchone()
+    if not candidate:
+        return
+    reason = (
+        f"Scheduled T.I.M.E. inventory checkpoint · {scheduled['test_reference']} · "
+        f"{scheduled['cat_priority']} CAT priority"
+    )
+    con.execute(
+        "UPDATE tasks SET time_foundation_test_id=?,adaptive_reason=? WHERE id=?",
+        (scheduled["test_id"], reason, candidate["id"]),
+    )
+    has_manual_material = con.execute(
+        "SELECT 1 FROM task_resource_assignments WHERE task_id=? AND manual_override=1",
+        (candidate["id"],),
+    ).fetchone()
+    if not has_manual_material:
+        con.execute(
+            "DELETE FROM task_resource_assignments WHERE task_id=? AND manual_override=0",
+            (candidate["id"],),
+        )
+        assign_task_resources(con, int(candidate["id"]))
+    con.execute(
+        "UPDATE time_foundation_schedule SET task_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (candidate["id"], scheduled["id"]),
+    )
+
+
 def aimcat_on(con: sqlite3.Connection, day: str):
     return con.execute(
         """SELECT * FROM aimcat_schedules
@@ -460,7 +595,6 @@ def plan_rows(con: sqlite3.Connection, day: str) -> list[dict[str, Any]]:
         planned[3].update(title="CAT consolidation · errors, routine and sleep", detail="Review error logs, test strategy and sleep consistency. No automatic full mocks.")
         for item in planned:
             item["adaptive_reason"] = "Final 11-day CAT consolidation · full mocks suppressed"
-    attach_time_foundation_checkpoint(con, day, planned, days_to_mock)
     return planned
 
 
@@ -700,57 +834,18 @@ def reconcile_aimcat_plans(con: sqlite3.Connection):
 
 
 def initialize_time_foundation_assignments(con: sqlite3.Connection):
-    """Attach checkpoints to eligible untouched August plans without replacing any task data."""
-    settings = row_map(con.execute("SELECT key,value FROM settings").fetchall())
-    if settings.get("timeFoundationPlannerVersion") == "2":
-        return
+    """Build the inventory schedule and attach it to every already-generated day."""
+    initialize_time_foundation_schedule(con)
     days = con.execute(
-        """SELECT DISTINCT date FROM tasks
-           WHERE date>? AND date<='2026-08-31' AND manual=0 AND archived=0 ORDER BY date""",
-        (PREP_START_DATE,),
+        """SELECT DISTINCT schedule.planned_date
+           FROM time_foundation_schedule schedule
+           JOIN tasks task ON task.date=schedule.planned_date AND task.archived=0
+           WHERE schedule.status='PLANNED' ORDER BY schedule.planned_date"""
     ).fetchall()
     for item in days:
-        desired = plan_rows(con, item["date"])
-        for planned in desired:
-            test_id = planned.get("time_foundation_test_id")
-            if not test_id:
-                continue
-            existing = con.execute(
-                """
-                SELECT task.id FROM tasks task
-                WHERE task.date=? AND task.subject=? AND task.kind='practice'
-                  AND task.manual=0 AND task.archived=0 AND task.completed=0
-                  AND task.rescheduled=0 AND task.time_foundation_test_id IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM task_results result WHERE result.task_id=task.id)
-                  AND NOT EXISTS (
-                    SELECT 1 FROM task_resource_assignments assignment
-                    WHERE assignment.task_id=task.id AND assignment.manual_override=1
-                  )
-                ORDER BY task.start_time LIMIT 1
-                """,
-                (item["date"], planned["subject"]),
-            ).fetchone()
-            if existing:
-                con.execute(
-                    "UPDATE tasks SET time_foundation_test_id=?,adaptive_reason=? WHERE id=?",
-                    (test_id, planned.get("adaptive_reason", ""), existing["id"]),
-                )
-    checkpoint_tasks = con.execute(
-        """SELECT task.id FROM tasks task WHERE task.time_foundation_test_id IS NOT NULL
-           AND task.manual=0 AND task.completed=0 AND task.archived=0 AND task.rescheduled=0
-           AND NOT EXISTS (
-             SELECT 1 FROM task_resource_assignments assignment
-             WHERE assignment.task_id=task.id AND assignment.manual_override=1
-           )"""
-    ).fetchall()
-    for task in checkpoint_tasks:
-        con.execute(
-            "DELETE FROM task_resource_assignments WHERE task_id=? AND manual_override=0",
-            (task["id"],),
-        )
-        assign_task_resources(con, int(task["id"]))
+        attach_scheduled_foundation_test(con, item["planned_date"])
     con.execute(
-        "INSERT INTO settings(key,value) VALUES('timeFoundationPlannerVersion','2') ON CONFLICT(key) DO UPDATE SET value='2'"
+        "INSERT INTO settings(key,value) VALUES('timeFoundationPlannerVersion','3') ON CONFLICT(key) DO UPDATE SET value='3'"
     )
 
 
@@ -929,25 +1024,43 @@ def stage_plan(task_row: sqlite3.Row | dict[str, Any]) -> list[tuple[str, int, i
         return [("PRACTICE", duration, 1)]
     if task_row["kind"] != "practice":
         return []
+
+    def split_stages(
+        first_stage: str,
+        first_cap: int,
+        first_target: int,
+        second_stage: str,
+        second_minimum: int,
+        second_target: int,
+    ) -> list[tuple[str, int, int]]:
+        """Split the available block without minimums inflating its total duration."""
+        first_minutes = min(first_cap, max(0, duration - second_minimum))
+        second_minutes = duration - first_minutes
+        stages = [
+            (first_stage, first_minutes, first_target),
+            (second_stage, second_minutes, second_target),
+        ]
+        return [stage for stage in stages if stage[1] > 0]
+
     if task_row["subject"] in ("Quant", "QA"):
         if level == "FOUNDATION":
-            return [("LEARN", min(55, duration), 0), ("PRACTICE", max(30, duration - 55), 12)]
+            return split_stages("LEARN", 55, 0, "PRACTICE", 30, 12)
         if level == "INTERMEDIATE":
-            return [("LEARN", min(30, duration), 0), ("PRACTICE", max(45, duration - 30), 18)]
+            return split_stages("LEARN", 30, 0, "PRACTICE", 45, 18)
         if level == "CAT_LEVEL":
-            return [("PRACTICE", min(80, duration), 20), ("PYQ", max(25, duration - 80), 6)]
+            return split_stages("PRACTICE", 80, 20, "PYQ", 25, 6)
         if level == "TIMED":
-            return [("PRACTICE", min(75, duration), 25), ("PYQ", max(30, duration - 75), 8)]
-        return [("PRACTICE", min(90, duration), 30), ("PYQ", max(30, duration - 90), 10)]
+            return split_stages("PRACTICE", 75, 25, "PYQ", 30, 8)
+        return split_stages("PRACTICE", 90, 30, "PYQ", 30, 10)
     if task_row["subject"] == "DILR":
         if level in ("FOUNDATION", "INTERMEDIATE"):
             target = min(1, int(task_row["target_count"] or 2)) if checkpoint else int(task_row["target_count"] or 2)
-            return [("LEARN", min(20, duration), 0), ("PRACTICE", max(30, duration - 20), target)]
-        return [("PRACTICE", min(60, duration), 2), ("PYQ", max(30, duration - 60), 1)]
+            return split_stages("LEARN", 20, 0, "PRACTICE", 30, target)
+        return split_stages("PRACTICE", 60, 2, "PYQ", 30, 1)
     if task_row["subject"] == "VARC":
         if level in ("FOUNDATION", "INTERMEDIATE"):
             return [("PRACTICE", duration, 7)]
-        return [("PRACTICE", min(60, duration), 5), ("PYQ", max(15, duration - 60), 2)]
+        return split_stages("PRACTICE", 60, 5, "PYQ", 15, 2)
     return []
 
 
@@ -1314,6 +1427,7 @@ def import_time_foundation_csv(con: sqlite3.Connection, content: str) -> dict[st
             created += 1
     if created + updated == 0:
         raise HTTPException(400, "The CSV did not contain any test rows")
+    initialize_time_foundation_schedule(con)
     return {"created": created, "updated": updated}
 
 
@@ -1417,6 +1531,8 @@ def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) 
 def topic_for_time_test(con: sqlite3.Connection, test_row: sqlite3.Row, task_row: sqlite3.Row | None):
     if task_row and task_row["topic_id"]:
         return con.execute("SELECT * FROM topics WHERE id=?", (task_row["topic_id"],)).fetchone()
+    if test_row["subject"] == "VARC" and test_row["canonical_topic"] == "READING_COMPREHENSION":
+        return match_topic(con, "VARC", "Reading Comprehension")
     exact_name = TIME_TOPIC_NAMES.get(test_row["canonical_topic"])
     if exact_name:
         return match_topic(con, "Quant", exact_name)
@@ -1478,6 +1594,12 @@ def record_time_foundation_result(con: sqlite3.Connection, payload: dict[str, An
     )
     inserted = cursor.fetchone() if backend == "postgresql" else None
     attempt_id = int(inserted["id"] if inserted else cursor.lastrowid)
+    con.execute(
+        """UPDATE time_foundation_schedule SET status='COMPLETED',
+                  task_id=COALESCE(?,task_id),updated_at=CURRENT_TIMESTAMP
+           WHERE test_id=?""",
+        (task_id, test_id),
+    )
     topic_row = topic_for_time_test(con, test_row, task_row)
     if topic_row:
         con.execute(
@@ -1628,6 +1750,67 @@ def restore_standard_plan(con: sqlite3.Connection, day: str):
     con.execute("INSERT OR IGNORE INTO plan_days(date) VALUES(?)", (day,))
 
 
+def relocate_auto_foundation_checkpoint(
+    con: sqlite3.Connection,
+    blocked_date: str,
+    preferred_date: str | None = None,
+) -> None:
+    """Move automatic checkpoints away from a newly selected full-mock date."""
+    collisions = con.execute(
+        """SELECT * FROM time_foundation_schedule
+           WHERE planned_date=? AND status='PLANNED' AND manual_override=0
+           ORDER BY id""",
+        (blocked_date,),
+    ).fetchall()
+    if not collisions:
+        return
+    occupied = {
+        row["planned_date"]
+        for row in con.execute(
+            "SELECT planned_date FROM time_foundation_schedule WHERE status='PLANNED'"
+        ).fetchall()
+    }
+    candidate_dates: list[str] = []
+    if preferred_date:
+        candidate_dates.append(preferred_date)
+    cursor = max(current_app_date(), date.fromisoformat(PREP_START_DATE))
+    while cursor <= date(2026, 11, 18):
+        candidate_dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    available = [
+        day for day in dict.fromkeys(candidate_dates)
+        if day != blocked_date and day not in occupied and not should_mock(day, con)
+    ]
+    for schedule, new_date in zip(collisions, available):
+        old_task = con.execute(
+            "SELECT * FROM tasks WHERE id=?", (schedule["task_id"],)
+        ).fetchone() if schedule["task_id"] else None
+        if old_task and not old_task["archived"] and old_task["time_foundation_test_id"] == schedule["test_id"]:
+            con.execute(
+                "UPDATE tasks SET time_foundation_test_id=NULL WHERE id=?",
+                (old_task["id"],),
+            )
+            manual_material = con.execute(
+                "SELECT 1 FROM task_resource_assignments WHERE task_id=? AND manual_override=1",
+                (old_task["id"],),
+            ).fetchone()
+            if not manual_material:
+                con.execute(
+                    "DELETE FROM task_resource_assignments WHERE task_id=? AND manual_override=0",
+                    (old_task["id"],),
+                )
+                assign_task_resources(con, int(old_task["id"]))
+        con.execute(
+            """UPDATE time_foundation_schedule
+               SET planned_date=?,task_id=NULL,
+                   selection_reason='Automatically moved away from a replanned AIMCAT',
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (new_date, schedule["id"]),
+        )
+        occupied.add(new_date)
+        attach_scheduled_foundation_test(con, new_date)
+
+
 def prioritize_analysis_carryover(con: sqlite3.Connection, day: str):
     """Carry unfinished AIMCAT analysis into the next day without touching user work."""
     previous = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
@@ -1721,6 +1904,7 @@ def set_aimcat_attempt_date(con: sqlite3.Connection, schedule_id: int, planned_d
     con.execute("INSERT OR IGNORE INTO plan_days(date) VALUES(?)", (planned_date,))
     if old_date and old_date != planned_date:
         restore_standard_plan(con, old_date)
+    relocate_auto_foundation_checkpoint(con, planned_date, old_date)
 
 
 def record_aimcat_result(con: sqlite3.Connection, schedule_id: int, payload: dict[str, Any]):
@@ -1802,9 +1986,13 @@ def record_aimcat_result(con: sqlite3.Connection, schedule_id: int, payload: dic
 
 
 def ensure_plan(con: sqlite3.Connection, day: str):
-    if con.execute("SELECT 1 FROM plan_days WHERE date=?", (day,)).fetchone() or day > "2026-11-29": return
-    for row in plan_rows(con, day): insert_task(con, row)
-    con.execute("INSERT OR IGNORE INTO plan_days(date) VALUES(?)", (day,))
+    if day > "2026-11-29":
+        return
+    if not con.execute("SELECT 1 FROM plan_days WHERE date=?", (day,)).fetchone():
+        for row in plan_rows(con, day):
+            insert_task(con, row)
+        con.execute("INSERT OR IGNORE INTO plan_days(date) VALUES(?)", (day,))
+    attach_scheduled_foundation_test(con, day)
 
 
 def rows(con: sqlite3.Connection, query: str, values=()):
@@ -1837,6 +2025,65 @@ def time_foundation_payload(con: sqlite3.Connection) -> list[dict[str, Any]]:
         item["advance_accuracy"] = float(settings.get("timeFoundationAdvanceAccuracy", "85"))
         item["confidence_gate"] = int(settings.get("timeFoundationConfidence", "4"))
     return catalog
+
+
+def time_foundation_schedule_payload(con) -> list[dict[str, Any]]:
+    return rows(
+        con,
+        """SELECT schedule.id,schedule.test_id,schedule.planned_date,schedule.task_id,
+                  schedule.status,schedule.manual_override,schedule.selection_reason,
+                  test.test_reference,test.provider_title,test.subject,test.level,test.category,
+                  test.cat_priority,test.cat_core,task.title AS task_title,task.start_time,
+                  CASE WHEN attempt.id IS NULL THEN 0 ELSE 1 END AS has_recorded_attempt
+           FROM time_foundation_schedule schedule
+           JOIN time_foundation_tests test ON test.id=schedule.test_id
+           LEFT JOIN tasks task ON task.id=schedule.task_id
+           LEFT JOIN time_foundation_attempts attempt ON attempt.id=(
+               SELECT latest.id FROM time_foundation_attempts latest
+               WHERE latest.test_id=test.id ORDER BY latest.attempted_on DESC,latest.id DESC LIMIT 1
+           )
+           ORDER BY schedule.planned_date,schedule.id""",
+    )
+
+
+def time_foundation_inventory_payload(con) -> list[dict[str, Any]]:
+    known = {
+        row["subject"]: int(row["total"])
+        for row in con.execute(
+            "SELECT subject,COUNT(*) AS total FROM time_foundation_tests WHERE active=1 GROUP BY subject"
+        ).fetchall()
+    }
+    planned = {
+        row["subject"]: int(row["total"])
+        for row in con.execute(
+            """SELECT test.subject,COUNT(*) AS total FROM time_foundation_schedule schedule
+               JOIN time_foundation_tests test ON test.id=schedule.test_id GROUP BY test.subject"""
+        ).fetchall()
+    }
+    recorded = {
+        row["subject"]: int(row["total"])
+        for row in con.execute(
+            """SELECT test.subject,COUNT(DISTINCT attempt.test_id) AS total
+               FROM time_foundation_attempts attempt
+               JOIN time_foundation_tests test ON test.id=attempt.test_id GROUP BY test.subject"""
+        ).fetchall()
+    }
+    payload = []
+    for subject in ("LR", "DI", "VARC", "QA"):
+        inventory = TIME_FOUNDATION_INVENTORY[subject]
+        payload.append(
+            {
+                "subject": subject,
+                "label": inventory["label"],
+                "portal_total": inventory["total"],
+                "portal_reported_attempted": inventory["reported_attempted"],
+                "known_references": known.get(subject, 0),
+                "missing_references": max(0, inventory["total"] - known.get(subject, 0)),
+                "scheduled_references": planned.get(subject, 0),
+                "northstar_recorded": recorded.get(subject, 0),
+            }
+        )
+    return payload
 
 
 def enrich_tasks_with_resources(con: sqlite3.Connection, task_rows: list[dict[str, Any]]):
@@ -2037,6 +2284,11 @@ def reschedule_task(con: sqlite3.Connection, task_id: int, to_date: str, to_star
         con.execute(
             "UPDATE tasks SET date=?,start_time=?,rescheduled=1 WHERE id=?",
             (to_date, shifted_start, task_row["id"]),
+        )
+        con.execute(
+            """UPDATE time_foundation_schedule SET planned_date=?,manual_override=1,
+                      updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND status='PLANNED'""",
+            (to_date, task_row["id"]),
         )
         moved_ids.append(int(task_row["id"]))
     return {"task_ids": moved_ids, "grouped": bool(grouped), "date": to_date}
@@ -2338,6 +2590,8 @@ def get_data(day: str) -> dict[str, Any]:
             "resourceAccess": rows(con, "SELECT * FROM user_resource_access ORDER BY enabled DESC,resource_provider"),
             "topicResourceMaps": rows(con, "SELECT * FROM topic_resource_maps ORDER BY topic_id,purpose,priority"),
             "timeFoundationTests": time_foundation_payload(con),
+            "timeFoundationSchedule": time_foundation_schedule_payload(con),
+            "timeFoundationInventory": time_foundation_inventory_payload(con),
             # Replace Material is opened from the selected day's plan; avoid repeating the
             # full catalogue for every future task in the application payload.
             "taskResourceOptions": task_resource_options(con, today_tasks, catalogue), "revisionSchedule": revisions,

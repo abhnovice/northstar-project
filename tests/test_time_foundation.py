@@ -21,7 +21,7 @@ class TimeFoundationTests(unittest.TestCase):
     def test_exact_catalog_is_seeded_without_acronym_inference(self):
         self.assertEqual(
             self.con.execute("SELECT COUNT(*) FROM time_foundation_tests").fetchone()[0],
-            43,
+            63,
         )
         row = self.con.execute(
             "SELECT * FROM time_foundation_tests WHERE test_reference='OBQ1001810'"
@@ -32,26 +32,60 @@ class TimeFoundationTests(unittest.TestCase):
         optional = self.con.execute(
             "SELECT COUNT(*) FROM time_foundation_tests WHERE cat_core=0"
         ).fetchone()[0]
-        self.assertEqual(optional, 5)
+        self.assertEqual(optional, 13)
+        verbal = self.con.execute(
+            "SELECT * FROM time_foundation_tests WHERE test_reference='OBE1001803'"
+        ).fetchone()
+        self.assertEqual(verbal["provider_title"], "Foundation - RC - 1")
+        self.assertEqual(verbal["subject"], "VARC")
+        self.assertEqual(verbal["canonical_topic"], "READING_COMPREHENSION")
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM aimcat_schedules").fetchone()[0], 20)
 
-    def test_planner_uses_occasional_cat_core_checkpoints(self):
-        days = [f"2026-08-{day:02d}" for day in range(17, 30)]
-        planned = [
-            task
-            for day in days
-            for task in main.plan_rows(self.con, day)
-            if task.get("time_foundation_test_id")
-        ]
-        self.assertGreaterEqual(len(planned), 1)
-        self.assertLess(len(planned), len(days))
-        for task in planned:
-            test = self.con.execute(
-                "SELECT * FROM time_foundation_tests WHERE id=?",
-                (task["time_foundation_test_id"],),
-            ).fetchone()
-            self.assertTrue(test["cat_core"])
-            self.assertNotEqual(test["cat_priority"], "LOW")
+    def test_every_known_reference_is_scheduled_once_outside_aimcat_days(self):
+        main.initialize_time_foundation_schedule(self.con)
+        schedule = self.con.execute(
+            "SELECT * FROM time_foundation_schedule ORDER BY planned_date,id"
+        ).fetchall()
+        self.assertEqual(len(schedule), 63)
+        self.assertEqual(len({row["test_id"] for row in schedule}), 63)
+        self.assertEqual(len({row["planned_date"] for row in schedule}), 63)
+        self.assertGreaterEqual(schedule[0]["planned_date"], main.current_app_date().isoformat())
+        self.assertLessEqual(schedule[-1]["planned_date"], "2026-11-18")
+        aimcat_collision = self.con.execute(
+            """SELECT COUNT(*) FROM time_foundation_schedule foundation
+               JOIN aimcat_schedules aimcat
+                 ON aimcat.planned_attempt_date=foundation.planned_date
+                AND aimcat.skipped=0
+                AND (aimcat.historical=0 OR aimcat.converted_to_additional=1)"""
+        ).fetchone()[0]
+        self.assertEqual(aimcat_collision, 0)
+
+    def test_future_checkpoint_attaches_when_its_day_is_opened(self):
+        scheduled = self.con.execute(
+            """SELECT schedule.*,test.subject FROM time_foundation_schedule schedule
+               JOIN time_foundation_tests test ON test.id=schedule.test_id
+               WHERE schedule.task_id IS NULL AND schedule.status='PLANNED'
+               ORDER BY schedule.planned_date LIMIT 1"""
+        ).fetchone()
+        self.assertIsNotNone(scheduled)
+        main.ensure_plan(self.con, scheduled["planned_date"])
+        attached = self.con.execute(
+            "SELECT * FROM time_foundation_schedule WHERE id=?", (scheduled["id"],)
+        ).fetchone()
+        self.assertIsNotNone(attached["task_id"])
+        task = self.con.execute("SELECT * FROM tasks WHERE id=?", (attached["task_id"],)).fetchone()
+        expected_subject = main.foundation_subject_block(scheduled["subject"])
+        self.assertEqual(task["subject"], expected_subject)
+        self.assertEqual(task["time_foundation_test_id"], scheduled["test_id"])
+        self.assertLessEqual(sum(stage[1] for stage in main.stage_plan(task)) + 45, task["duration"])
+
+    def test_portal_totals_make_missing_quant_references_explicit(self):
+        inventory = {row["subject"]: row for row in main.time_foundation_inventory_payload(self.con)}
+        self.assertEqual(inventory["LR"]["portal_reported_attempted"], 2)
+        self.assertEqual(inventory["VARC"]["portal_reported_attempted"], 1)
+        self.assertEqual(inventory["QA"]["portal_total"], 37)
+        self.assertEqual(inventory["QA"]["known_references"], 20)
+        self.assertEqual(inventory["QA"]["missing_references"], 17)
 
     def test_today_payload_contains_exact_reference_and_portal(self):
         task = self.con.execute(
@@ -62,7 +96,7 @@ class TimeFoundationTests(unittest.TestCase):
         payload = [dict(task)]
         main.enrich_tasks_with_resources(self.con, payload)
         checkpoint = payload[0]["time_foundation_test"]
-        self.assertTrue(checkpoint["test_reference"].startswith(("OBQ", "OBD", "OBL")))
+        self.assertTrue(checkpoint["test_reference"].startswith(("OBQ", "OBD", "OBL", "OBE")))
         self.assertEqual(checkpoint["url"], "https://www.time4education.com/")
         stages = main.stage_plan(task)
         self.assertLessEqual(sum(stage[1] for stage in stages) + 45, task["duration"])
@@ -88,6 +122,10 @@ class TimeFoundationTests(unittest.TestCase):
             },
         )
         self.assertEqual(result["outcome"], "ADVANCE")
+        schedule = self.con.execute(
+            "SELECT * FROM time_foundation_schedule WHERE test_id=?", (test["id"],)
+        ).fetchone()
+        self.assertEqual(schedule["status"], "COMPLETED")
         updated = self.con.execute("SELECT * FROM topics WHERE id=?", (task["topic_id"],)).fetchone()
         self.assertIn(updated["progression_level"], ("CAT_LEVEL", "TIMED", "MIXED"))
         revision = self.con.execute(
@@ -131,6 +169,12 @@ class TimeFoundationTests(unittest.TestCase):
             self.con.execute("SELECT COUNT(*) FROM time_foundation_tests").fetchone()[0],
             before + 1,
         )
+        imported = self.con.execute(
+            """SELECT schedule.* FROM time_foundation_schedule schedule
+               JOIN time_foundation_tests test ON test.id=schedule.test_id
+               WHERE test.test_reference='OBQ1001999'"""
+        ).fetchone()
+        self.assertIsNotNone(imported)
         row = self.con.execute(
             "SELECT * FROM time_foundation_tests WHERE test_reference='OBQ1001999'"
         ).fetchone()

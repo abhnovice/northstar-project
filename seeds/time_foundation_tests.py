@@ -4,6 +4,13 @@ Provider titles are deliberately stored verbatim. In particular, unknown provide
 acronyms are not expanded into canonical topics.
 """
 
+TIME_FOUNDATION_INVENTORY = {
+    "LR": {"label": "Logical Reasoning", "total": 11, "reported_attempted": 2},
+    "DI": {"label": "Data Interpretation", "total": 12, "reported_attempted": 0},
+    "VARC": {"label": "Verbal Ability", "total": 20, "reported_attempted": 1},
+    "QA": {"label": "Quantitative Ability", "total": 37, "reported_attempted": 0},
+}
+
 TIME_FOUNDATION_TESTS = [
     # Data Interpretation
     ("OBD1002101", "Tables 2", "DI", "TABLES", None, None, "HIGH"),
@@ -30,6 +37,27 @@ TIME_FOUNDATION_TESTS = [
     ("OBL1001849", "Foundation - OMET Qn types - 2", "LR", "OMET", None, None, "LOW"),
     ("OBL1001851", "Foundation - Puzzles - Distribution, Selections, Comparisions - 3", "LR", "DISTRIBUTION_SELECTION_COMPARISON", None, None, "HIGH"),
     ("OBL1001852", "Foundation - OMET Qn types - 3", "LR", "OMET", None, None, "LOW"),
+    # Verbal Ability
+    ("OBE1001801", "Foundation - VA - 1", "VARC", "VERBAL_ABILITY", None, None, "HIGH"),
+    ("OBE1001802", "Foundation - Grammar - 1", "VARC", "GRAMMAR", None, None, "LOW"),
+    ("OBE1001803", "Foundation - RC - 1", "VARC", "RC", None, "READING_COMPREHENSION", "HIGH"),
+    ("OBE1001804", "Foundation - VA - 1", "VARC", "VERBAL_ABILITY", None, None, "HIGH"),
+    ("OBE1001805", "Foundation - Grammar - 1", "VARC", "GRAMMAR", None, None, "LOW"),
+    ("OBE1001806", "Foundation - VA - 1", "VARC", "VERBAL_ABILITY", None, None, "HIGH"),
+    ("OBE1001807", "Foundation - RC - 1", "VARC", "RC", None, "READING_COMPREHENSION", "HIGH"),
+    ("OBE1001808", "Foundation - Vocabulary - 1", "VARC", "VOCABULARY", None, None, "LOW"),
+    ("OBE1001809", "Foundation - Grammar - 1", "VARC", "GRAMMAR", None, None, "LOW"),
+    ("OBE1001810", "Foundation - VA - 1", "VARC", "VERBAL_ABILITY", None, None, "HIGH"),
+    ("OBE1001811", "Foundation - Grammar - 1", "VARC", "GRAMMAR", None, None, "LOW"),
+    ("OBE1001812", "Foundation - VA - 1", "VARC", "VERBAL_ABILITY", None, None, "HIGH"),
+    ("OBE1001813", "Foundation - Verbal Reasoning - 1", "VARC", "VERBAL_REASONING", None, None, "LOW"),
+    ("OBE1001814", "Foundation - RC - 1", "VARC", "RC", None, "READING_COMPREHENSION", "HIGH"),
+    ("OBE1001815", "Foundation - Grammar - 1", "VARC", "GRAMMAR", None, None, "LOW"),
+    ("OBE1001816", "Foundation - RC - 1", "VARC", "RC", None, "READING_COMPREHENSION", "HIGH"),
+    ("OBE1001817", "Foundation - RC - 1", "VARC", "RC", None, "READING_COMPREHENSION", "HIGH"),
+    ("OBE1001818", "Foundation - VA - 3", "VARC", "VERBAL_ABILITY", None, None, "HIGH"),
+    ("OBE1001819", "Foundation - Grammar - 3", "VARC", "GRAMMAR", None, None, "LOW"),
+    ("OBE1001820", "Foundation - RC - 3", "VARC", "RC", None, "READING_COMPREHENSION", "HIGH"),
     # Quantitative Ability
     ("OBQ1001801", "Foundation - ERPV - 1", "QA", None, "ARITHMETIC", None, "HIGH"),
     ("OBQ1001802", "Foundation - PPL - 1", "QA", None, "ARITHMETIC", None, "HIGH"),

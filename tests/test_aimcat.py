@@ -84,6 +84,19 @@ class AimcatPlannerTests(unittest.TestCase):
             "SELECT kind FROM tasks WHERE date='2026-08-16' AND archived=0 AND manual=0"
         ).fetchall()
         self.assertNotIn("mock", {row["kind"] for row in old_day})
+        checkpoint_collision = self.con.execute(
+            "SELECT COUNT(*) FROM time_foundation_schedule WHERE planned_date='2026-08-17' AND status='PLANNED'"
+        ).fetchone()[0]
+        self.assertEqual(checkpoint_collision, 0)
+        relocated = self.con.execute(
+            """SELECT schedule.*,task.date AS task_date,task.time_foundation_test_id
+               FROM time_foundation_schedule schedule
+               LEFT JOIN tasks task ON task.id=schedule.task_id
+               WHERE schedule.planned_date='2026-08-16' AND schedule.status='PLANNED'"""
+        ).fetchone()
+        self.assertIsNotNone(relocated)
+        self.assertEqual(relocated["task_date"], "2026-08-16")
+        self.assertEqual(relocated["time_foundation_test_id"], relocated["test_id"])
         with self.assertRaises(HTTPException):
             main.set_aimcat_attempt_date(self.con, schedule["id"], "2026-08-20")
 

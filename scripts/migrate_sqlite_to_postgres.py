@@ -21,6 +21,7 @@ TABLE_ORDER = [
     "task_resource_assignments", "task_results", "topic_performance_events",
     "revision_schedule", "adaptive_signals", "plan_days", "task_reschedule_history",
     "time_foundation_attempts", "task_early_completion_history", "topic_resource_preferences",
+    "time_foundation_schedule",
 ]
 
 FOREIGN_KEYS = [
@@ -46,6 +47,8 @@ FOREIGN_KEYS = [
     ("task_early_completion_history", "replacement_task_id", "tasks", "id"),
     ("topic_resource_preferences", "topic_id", "topics", "id"),
     ("topic_resource_preferences", "resource_id", "study_resources", "id"),
+    ("time_foundation_schedule", "test_id", "time_foundation_tests", "id"),
+    ("time_foundation_schedule", "task_id", "tasks", "id"),
 ]
 
 UNIQUE_KEYS = [
@@ -56,6 +59,7 @@ UNIQUE_KEYS = [
     ("task_results", ("task_id",)),
     ("topic_performance_events", ("topic_id", "source_type", "source_id")),
     ("topic_resource_preferences", ("topic_id", "stage")),
+    ("time_foundation_schedule", ("test_id",)),
 ]
 
 

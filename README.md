@@ -140,6 +140,8 @@ Scheduled T.I.M.E. AIMCATs are the Priority A full-mock backbone; the planner do
 
 The T.I.M.E. portal URL is configurable under Settings. Northstar opens it in a new tab and never attempts to sign in.
 
+The T.I.M.E. Foundation inventory is scheduled as 45-minute checkpoints inside existing Quant, DILR, and VARC blocks, one checkpoint per non-AIMCAT evening. Northstar currently contains all 11 supplied Logical Reasoning, all 12 Data Interpretation, all 20 Verbal Ability, and the 20 supplied Quantitative Ability references. The portal reports 37 Quantitative Ability tests, so the remaining 17 exact QA references are shown as missing until they are imported; Northstar does not invent them. The reported two LR and one Verbal attempts are retained as aggregate portal counts because the supplied status list did not identify the exact completed references. Replanning an AIMCAT automatically moves any conflicting non-manual Foundation checkpoint, while manually moved study work remains protected.
+
 ## Important implementation notes
 
 - Official deadlines are visually distinct from personal targets and are never silently altered.
