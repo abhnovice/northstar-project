@@ -1693,16 +1693,25 @@ def aimcat_payload(con: sqlite3.Connection, reference_day: str) -> tuple[list[di
     mock_rows = rows(con, "SELECT * FROM mocks ORDER BY date,id")
     mocks_by_id = {item["id"]: item for item in mock_rows}
     schedules = []
+    status_changes: list[tuple[int, str]] = []
     for raw in con.execute("SELECT * FROM aimcat_schedules ORDER BY start_date,id").fetchall():
         item = dict(raw)
         item["status"] = status_for(raw, reference_day)
         item["diagnosis"] = decode_diagnosis(item["diagnosis_json"])
         item["result"] = mocks_by_id.get(item["mock_id"])
-        con.execute(
-            "UPDATE aimcat_schedules SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!=?",
-            (item["status"], item["id"], item["status"]),
-        )
+        if raw["status"] != item["status"]:
+            status_changes.append((int(item["id"]), item["status"]))
         schedules.append(item)
+    if status_changes:
+        cases = " ".join("WHEN ? THEN ?" for _ in status_changes)
+        identifiers = ",".join("?" for _ in status_changes)
+        parameters = [value for change in status_changes for value in change]
+        con.execute(
+            f"""UPDATE aimcat_schedules
+                SET status=CASE id {cases} ELSE status END,updated_at=CURRENT_TIMESTAMP
+                WHERE id IN ({identifiers})""",
+            (*parameters, *(change[0] for change in status_changes)),
+        )
     future = [item for item in schedules if item["status"] not in ("PAST", "COMPLETED", "MISSED") and (item["planned_attempt_date"] or item["end_date"]) >= reference_day]
     completed = [item for item in schedules if item["actual_attempt_date"]]
     next_item = future[0] if future else None
@@ -2086,7 +2095,11 @@ def time_foundation_inventory_payload(con) -> list[dict[str, Any]]:
     return payload
 
 
-def enrich_tasks_with_resources(con: sqlite3.Connection, task_rows: list[dict[str, Any]]):
+def enrich_tasks_with_resources(
+    con: sqlite3.Connection,
+    task_rows: list[dict[str, Any]],
+    foundation_tests: list[dict[str, Any]] | None = None,
+):
     assignments = rows(
         con,
         """
@@ -2109,7 +2122,10 @@ def enrich_tasks_with_resources(con: sqlite3.Connection, task_rows: list[dict[st
     by_task: dict[int, list[dict[str, Any]]] = {}
     for assignment in assignments:
         by_task.setdefault(assignment["task_id"], []).append(assignment)
-    tests = {item["id"]: item for item in time_foundation_payload(con)}
+    tests = {
+        item["id"]: item
+        for item in (foundation_tests if foundation_tests is not None else time_foundation_payload(con))
+    }
     for task_row in task_rows:
         task_row["resource_stages"] = by_task.get(task_row["id"], [])
         task_row["result"] = results.get(task_row["id"])
@@ -2242,7 +2258,13 @@ def reschedule_task(con: sqlite3.Connection, task_id: int, to_date: str, to_star
             (selected["aimcat_schedule_id"],),
         ).fetchall()]
         set_aimcat_attempt_date(con, int(selected["aimcat_schedule_id"]), to_date)
-        return {"task_ids": lifecycle_ids, "grouped": len(lifecycle_ids) > 1, "date": to_date}
+        return {
+            "task_ids": lifecycle_ids,
+            "tasks": [],
+            "grouped": len(lifecycle_ids) > 1,
+            "date": to_date,
+            "refresh_required": True,
+        }
 
     mock_day = con.execute(
         "SELECT 1 FROM tasks WHERE date=? AND kind='mock' AND manual=0 AND archived=0",
@@ -2269,6 +2291,7 @@ def reschedule_task(con: sqlite3.Connection, task_id: int, to_date: str, to_star
         raise HTTPException(400, "The moved work must finish by midnight; choose an earlier start time")
     grouped = int(len(task_rows) > 1)
     moved_ids = []
+    moved_tasks = []
     for task_row in task_rows:
         shifted_start = clock_from_minutes(new_start + minutes_from_clock(task_row["start_time"]) - base_start)
         if len(task_rows) == 1:
@@ -2291,7 +2314,21 @@ def reschedule_task(con: sqlite3.Connection, task_id: int, to_date: str, to_star
             (to_date, task_row["id"]),
         )
         moved_ids.append(int(task_row["id"]))
-    return {"task_ids": moved_ids, "grouped": bool(grouped), "date": to_date}
+        moved_tasks.append(
+            {
+                "id": int(task_row["id"]),
+                "date": to_date,
+                "start_time": shifted_start,
+                "rescheduled": 1,
+            }
+        )
+    return {
+        "task_ids": moved_ids,
+        "tasks": moved_tasks,
+        "grouped": bool(grouped),
+        "date": to_date,
+        "refresh_required": False,
+    }
 
 
 def _movable_curriculum_task(con, task_row, completion_date: str, vacated_task) -> tuple[bool, str]:
@@ -2556,7 +2593,8 @@ def get_data(day: str) -> dict[str, Any]:
         mocks = rows(con, "SELECT * FROM mocks ORDER BY date")
         errors = rows(con, "SELECT * FROM errors ORDER BY date DESC,id DESC")
         aimcats, aimcat_meta, aimcat_trend = aimcat_payload(con, current_app_date().isoformat())
-        enrich_tasks_with_resources(con, tasks)
+        foundation_tests = time_foundation_payload(con)
+        enrich_tasks_with_resources(con, tasks, foundation_tests)
         catalogue = resource_catalogue(con)
         today_tasks = [x for x in tasks if x["date"] == day]
         due = sum(bool(x["next_revision"] and x["next_revision"] <= day) for x in topics)
@@ -2589,7 +2627,7 @@ def get_data(day: str) -> dict[str, Any]:
             "resourceCatalogue": catalogue,
             "resourceAccess": rows(con, "SELECT * FROM user_resource_access ORDER BY enabled DESC,resource_provider"),
             "topicResourceMaps": rows(con, "SELECT * FROM topic_resource_maps ORDER BY topic_id,purpose,priority"),
-            "timeFoundationTests": time_foundation_payload(con),
+            "timeFoundationTests": foundation_tests,
             "timeFoundationSchedule": time_foundation_schedule_payload(con),
             "timeFoundationInventory": time_foundation_inventory_payload(con),
             # Replace Material is opened from the selected day's plan; avoid repeating the
@@ -2636,6 +2674,7 @@ def api_database_health():
 @app.post("/api/app")
 def api_action(body: Action):
     p, action = body.payload, body.action
+    action_result: dict[str, Any] | None = None
     with connection() as con:
         if action == "toggleTask":
             completed = int(bool(p.get("completed")))
@@ -2750,16 +2789,12 @@ def api_action(body: Action):
                 bool(p.get("prefer_for_topic")),
             )
         elif action == "rescheduleTask":
-            selected = con.execute("SELECT * FROM tasks WHERE id=? AND archived=0", (int(p.get("task_id", 0)),)).fetchone()
-            if selected and selected["aimcat_schedule_id"] and selected["kind"] == "mock":
-                set_aimcat_attempt_date(con, int(selected["aimcat_schedule_id"]), str(p.get("date", "")))
-            else:
-                reschedule_task(
-                    con,
-                    int(p.get("task_id", 0)),
-                    str(p.get("date", "")),
-                    str(p.get("start_time", "")),
-                )
+            action_result = reschedule_task(
+                con,
+                int(p.get("task_id", 0)),
+                str(p.get("date", "")),
+                str(p.get("start_time", "")),
+            )
         elif action == "completeScheduledTopicEarly":
             complete_scheduled_topic_early(
                 con,
@@ -2836,7 +2871,7 @@ def api_action(body: Action):
             keys=["date","actual_hours","energy","focus","went_well","difficult","tomorrow"]
             con.execute("INSERT INTO day_reviews(date,actual_hours,energy,focus,went_well,difficult,tomorrow) VALUES(?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET actual_hours=excluded.actual_hours,energy=excluded.energy,focus=excluded.focus,went_well=excluded.went_well,difficult=excluded.difficult,tomorrow=excluded.tomorrow",tuple(p.get(k) for k in keys))
         else: raise HTTPException(400, "Unknown action")
-    return {"ok": True}
+    return {"ok": True, "result": action_result}
 
 
 def insert_named(con, table, payload, keys):

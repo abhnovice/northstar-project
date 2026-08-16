@@ -3,7 +3,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { addDays, addMonths, differenceInCalendarDays, format, getDaysInMonth, parseISO, startOfMonth, startOfWeek } from "date-fns";
 import { LayoutDashboard, CalendarDays, Target, Calculator, Table2, BookOpenText, ClipboardCheck, CircleAlert, GraduationCap, Building2, Library, ChartNoAxesCombined, CalendarCheck, Flag, UserRound, Settings, Bell, Search, Plus, ChevronRight, Clock3, Check, Moon, Sun, Menu, X, Sparkles, BookMarked, ExternalLink, SlidersHorizontal, Save, RotateCcw, Brain, CircleCheck, CircleDashed, ArrowUpRight, Play, Pause, RefreshCw } from "lucide-react";
 import type { AimcatSchedule, AppData, StudyTask, TaskResourceStage, TimeFoundationTest, Topic } from "@/lib/types";
-import { completionAccuracy, externalMaterialLinkProps, filterResourceOptions, searchCalendarTasks, taskStageKey, type ResourceFilters } from "@/lib/resource-flow";
+import { applyTaskMovePatch, completionAccuracy, externalMaterialLinkProps, filterResourceOptions, isTaskMovePatch, searchCalendarTasks, taskStageKey, type ResourceFilters } from "@/lib/resource-flow";
 import { Badge, Card, Empty, Field, Modal, Progress, SectionTitle } from "./ui";
 import { AimcatTrendChart, ErrorChart, HoursChart } from "./charts";
 
@@ -21,7 +21,27 @@ const viewTitles: Record<View,string> = {dashboard:"Command center",today:"Tonig
 
 export function CommandCenter({ initialData }: { initialData: AppData }) {
   const [data,setData]=useState(initialData); const [view,setView]=useState<View>("dashboard"); const [theme,setTheme]=useState(data.settings.theme||"light"); const [sidebar,setSidebar]=useState(false); const [modal,setModal]=useState<string|null>(null); const [busy,setBusy]=useState(false); const [toast,setToast]=useState(""); const [date,setDate]=useState(data.meta.today); const [startFocus,setStartFocus]=useState(false); const [highlightTask,setHighlightTask]=useState<number|null>(null);
-  async function action(name:string,payload:Record<string,unknown>,message="Saved") { setBusy(true); const response=await fetch("/api/app",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:name,payload})}); if(!response.ok){const e=await response.json();setToast(e.detail||e.error||"Could not save");setBusy(false);throw new Error(e.detail||"Could not save");} const updated=await fetch(`/api/app?date=${date}`).then(r=>r.json()); setData(updated);setBusy(false);setModal(null);setToast(message);setTimeout(()=>setToast(""),2600); }
+  async function action(name:string,payload:Record<string,unknown>,message="Saved") {
+    setBusy(true);
+    try {
+      const response=await fetch("/api/app",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:name,payload})});
+      const responseData=await response.json();
+      if(!response.ok)throw new Error(responseData.detail||responseData.error||"Could not save");
+      if(name==="rescheduleTask"&&isTaskMovePatch(responseData.result)){
+        setData(current=>applyTaskMovePatch(current,responseData.result,date));
+      }else{
+        const refresh=await fetch(`/api/app?date=${date}`);
+        if(!refresh.ok)throw new Error("Saved, but the updated plan could not be loaded");
+        setData(await refresh.json());
+      }
+      setModal(null);setToast(message);setTimeout(()=>setToast(""),2600);
+    }catch(error){
+      setToast(error instanceof Error?error.message:"Could not save");
+      throw error;
+    }finally{
+      setBusy(false);
+    }
+  }
   async function changeDate(next:string){setDate(next);setBusy(true);const updated=await fetch(`/api/app?date=${next}`).then(r=>r.json());setData(updated);setBusy(false);}
   function navigate(next:View){setView(next);setSidebar(false);}
   return <div className={`app ${theme}`}>

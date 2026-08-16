@@ -1,3 +1,5 @@
+import type { AppData, StudyTask, TaskResourceOption } from "./types";
+
 export const externalMaterialLinkProps = {
   target: "_blank",
   rel: "noopener noreferrer",
@@ -9,6 +11,46 @@ export function completionAccuracy(attempted: number, correct: number) {
 
 export function taskStageKey(taskId: number, stage: string) {
   return `${taskId}:${stage}`;
+}
+
+export type TaskMovePatch = {
+  refresh_required:boolean;
+  task_ids:number[];
+  tasks:Array<{id:number;date:string;start_time:string;rescheduled:number}>;
+  date:string;
+  grouped:boolean;
+};
+
+export function isTaskMovePatch(value:unknown):value is TaskMovePatch {
+  if(!value||typeof value!=="object")return false;
+  const patch=value as Partial<TaskMovePatch>;
+  return patch.refresh_required===false&&Array.isArray(patch.tasks)&&patch.tasks.every(task=>
+    typeof task?.id==="number"&&typeof task?.date==="string"&&typeof task?.start_time==="string"
+  );
+}
+
+export function applyTaskMovePatch(data:AppData, patch:TaskMovePatch, selectedDate:string):AppData {
+  const updates=new Map(patch.tasks.map(task=>[task.id,task]));
+  const tasks=data.tasks.map(task=>{
+    const update=updates.get(task.id);
+    return update?{...task,...update}:task;
+  }).sort((a,b)=>a.date.localeCompare(b.date)||a.start_time.localeCompare(b.start_time)||a.id-b.id);
+  const selectedTasks=tasks.filter(task=>task.date===selectedDate);
+  const plannedMinutes=selectedTasks.reduce((total,task)=>total+task.duration,0);
+  const completedMinutes=selectedTasks.reduce((total,task)=>{
+    if(task.completed)return total+(task.actual_duration||task.duration);
+    return total+Math.round(task.duration*task.completion/100);
+  },0);
+  return {
+    ...data,
+    tasks,
+    timeFoundationSchedule:data.timeFoundationSchedule.map(item=>{
+      if(item.task_id===null)return item;
+      const update=updates.get(item.task_id);
+      return update?{...item,planned_date:update.date,manual_override:1}:item;
+    }),
+    meta:{...data.meta,plannedMinutes,completedMinutes},
+  };
 }
 
 export type ResourceFilters = {
@@ -58,4 +100,3 @@ export function searchCalendarTasks(tasks:StudyTask[], query:string) {
     ]),
   ]).includes(needle)).sort((a,b)=>a.date.localeCompare(b.date)||a.start_time.localeCompare(b.start_time));
 }
-import type { StudyTask, TaskResourceOption } from "./types";

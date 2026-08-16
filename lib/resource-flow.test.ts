@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import type { StudyTask, TaskResourceOption } from "./types";
-import { completionAccuracy, externalMaterialLinkProps, filterResourceOptions, searchCalendarTasks, taskStageKey, type ResourceFilters } from "./resource-flow";
+import type { AppData, StudyTask, TaskResourceOption } from "./types";
+import { applyTaskMovePatch, completionAccuracy, externalMaterialLinkProps, filterResourceOptions, isTaskMovePatch, searchCalendarTasks, taskStageKey, type ResourceFilters } from "./resource-flow";
 
 describe("study material return flow", () => {
   it("opens external material without replacing the plan tab", () => {
@@ -38,5 +38,24 @@ describe("calendar topic search",()=>{
   it("finds a future topic and a T.I.M.E. test reference",()=>{
     expect(searchCalendarTasks([task],"cubes")[0].id).toBe(7);
     expect(searchCalendarTasks([task],"OBL1001812")[0].id).toBe(7);
+  });
+
+  it("applies a task move without discarding material or reloading application data",()=>{
+    const data={
+      tasks:[task],
+      timeFoundationSchedule:[{id:4,task_id:task.id,planned_date:task.date,manual_override:0}],
+      meta:{plannedMinutes:task.duration,completedMinutes:0},
+    } as AppData;
+    const patch={
+      refresh_required:false,task_ids:[task.id],grouped:false,date:"2026-08-25",
+      tasks:[{id:task.id,date:"2026-08-25",start_time:"19:15",rescheduled:1}],
+    };
+    expect(isTaskMovePatch(patch)).toBe(true);
+    const updated=applyTaskMovePatch(data,patch,"2026-08-24");
+    expect(updated.tasks[0]).toMatchObject({id:task.id,date:"2026-08-25",start_time:"19:15",rescheduled:1});
+    expect(updated.tasks[0].resource_stages).toBe(task.resource_stages);
+    expect(updated.timeFoundationSchedule[0]).toMatchObject({planned_date:"2026-08-25",manual_override:1});
+    expect(updated.meta.plannedMinutes).toBe(0);
+    expect(updated.meta.completedMinutes).toBe(0);
   });
 });

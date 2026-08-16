@@ -1,6 +1,7 @@
 import unittest
 import os
 from datetime import datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 os.environ["NORTHSTAR_DATABASE_URL"] = "sqlite"
 
 import main
+import database
 
 
 class CommandCenterTests(unittest.TestCase):
@@ -52,6 +54,61 @@ class CommandCenterTests(unittest.TestCase):
         response = self.client.get("/api/app")
         expected = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
         self.assertEqual(response.json()["meta"]["today"], expected)
+
+    def test_full_payload_stays_within_remote_query_budget(self):
+        original_execute = database.ConnectionAdapter.execute
+        query_count = 0
+
+        def counted_execute(adapter, statement, parameters=None):
+            nonlocal query_count
+            query_count += 1
+            return original_execute(adapter, statement, parameters)
+
+        with patch.object(database.ConnectionAdapter, "execute", counted_execute):
+            payload = main.get_data("2026-08-16")
+        self.assertTrue(payload["resourceCoverage"]["valid"])
+        self.assertLessEqual(query_count, 45)
+
+    def test_task_move_action_returns_lightweight_patch(self):
+        task_row = main.task(
+            "2026-10-20", "18:00", 60, "Quant", "API move probe",
+            "Temporary move probe", "", "", 0, 0, "Low", "manual",
+        )
+        task_row["manual"] = 1
+        with main.connection() as con:
+            task_id = main.insert_task(con, task_row)
+        try:
+            original_execute = database.ConnectionAdapter.execute
+            query_count = 0
+
+            def counted_execute(adapter, statement, parameters=None):
+                nonlocal query_count
+                query_count += 1
+                return original_execute(adapter, statement, parameters)
+
+            with patch.object(database.ConnectionAdapter, "execute", counted_execute):
+                response = self.client.post(
+                    "/api/app",
+                    json={
+                        "action": "rescheduleTask",
+                        "payload": {"task_id": task_id, "date": "2026-10-21", "start_time": "19:15"},
+                    },
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertLessEqual(query_count, 5)
+            result = response.json()["result"]
+            self.assertFalse(result["refresh_required"])
+            self.assertEqual(
+                result["tasks"],
+                [{"id": task_id, "date": "2026-10-21", "start_time": "19:15", "rescheduled": 1}],
+            )
+            with main.connection() as con:
+                moved = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            self.assertEqual((moved["date"], moved["start_time"]), ("2026-10-21", "19:15"))
+        finally:
+            with main.connection() as con:
+                con.execute("DELETE FROM task_reschedule_history WHERE task_id=?", (task_id,))
+                con.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_resource_migration_and_seed_are_available(self):
         data = self.client.get("/api/app?date=2026-08-12").json()

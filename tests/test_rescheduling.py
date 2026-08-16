@@ -54,6 +54,11 @@ class TaskReschedulingTests(unittest.TestCase):
             (task["id"],),
         ).fetchone()
         self.assertEqual(result["task_ids"], [task["id"]])
+        self.assertFalse(result["refresh_required"])
+        self.assertEqual(
+            result["tasks"],
+            [{"id": task["id"], "date": target, "start_time": "19:10", "rescheduled": 1}],
+        )
         self.assertFalse(result["grouped"])
         self.assertEqual((moved["date"], moved["start_time"], moved["rescheduled"]), (target, "19:10", 1))
         self.assertEqual(preserved["resource_id"], assignment["resource_id"])
@@ -82,6 +87,8 @@ class TaskReschedulingTests(unittest.TestCase):
             "SELECT * FROM tasks WHERE date=? ORDER BY start_time", (target,)
         ).fetchall()
         self.assertTrue(result["grouped"])
+        self.assertTrue(result["refresh_required"])
+        self.assertEqual(result["tasks"], [])
         self.assertEqual(len(result["task_ids"]), 3)
         self.assertEqual([row["start_time"] for row in moved if row["aimcat_schedule_id"]], ["18:00", "20:00", "23:00"])
         self.assertTrue(all(row["rescheduled"] for row in moved))

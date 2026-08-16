@@ -99,23 +99,43 @@ def dilr_performance(con: sqlite3.Connection) -> list[dict[str, Any]]:
     by_topic: dict[int, list[sqlite3.Row]] = {}
     for row in result_rows:
         by_topic.setdefault(row["topic_id"], []).append(row)
+    topic_rows = con.execute(
+        """
+        WITH ranked_resources AS (
+            SELECT trm.topic_id,sr.provider,sr.title,sr.url,sr.platform_path,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY trm.topic_id ORDER BY trm.priority,sr.provider,sr.id
+                   ) AS resource_rank
+            FROM topic_resource_maps trm
+            JOIN study_resources sr ON sr.id=trm.resource_id AND sr.active=1
+            JOIN user_resource_access ura
+              ON ura.resource_provider=sr.provider AND ura.enabled=1
+            WHERE trm.purpose='PRACTICE'
+        )
+        SELECT topic.id,topic.name,topic.confidence,topic.progression_level,
+               resource.provider,resource.title AS resource_title,
+               resource.url,resource.platform_path
+        FROM topics topic
+        LEFT JOIN ranked_resources resource
+          ON resource.topic_id=topic.id AND resource.resource_rank=1
+        WHERE topic.subject='DILR'
+        ORDER BY topic.id
+        """
+    ).fetchall()
     output = []
-    for topic in con.execute("SELECT id,name,confidence,progression_level FROM topics WHERE subject='DILR' ORDER BY id"):
+    for topic in topic_rows:
         samples = by_topic.get(topic["id"], [])
         attempted = sum(max(0, int(row["attempted"] or 0)) for row in samples)
         solved = sum(int(row["dilr_sets_solved"] or 0) for row in samples)
         times = [int(row["time_spent"]) for row in samples if row["time_spent"]]
-        bank = con.execute(
-            """
-            SELECT sr.provider,sr.title,sr.url,sr.platform_path
-            FROM topic_resource_maps trm
-            JOIN study_resources sr ON sr.id=trm.resource_id AND sr.active=1
-            JOIN user_resource_access ura ON ura.resource_provider=sr.provider AND ura.enabled=1
-            WHERE trm.topic_id=? AND trm.purpose='PRACTICE'
-            ORDER BY trm.priority LIMIT 1
-            """,
-            (topic["id"],),
-        ).fetchone()
+        bank = None
+        if topic["provider"]:
+            bank = {
+                "provider": topic["provider"],
+                "title": topic["resource_title"],
+                "url": topic["url"],
+                "platform_path": topic["platform_path"],
+            }
         output.append(
             {
                 "topic_id": topic["id"],
@@ -126,7 +146,7 @@ def dilr_performance(con: sqlite3.Connection) -> list[dict[str, Any]]:
                 "median_time": round(float(median(times)), 1) if times else 0,
                 "confidence": topic["confidence"],
                 "progression_level": topic["progression_level"],
-                "primary_resource": dict(bank) if bank else None,
+                "primary_resource": bank,
             }
         )
     return output
@@ -168,26 +188,32 @@ def varc_analysis(con: sqlite3.Connection) -> dict[str, Any]:
 
 def coverage_report(con: sqlite3.Connection) -> dict[str, Any]:
     issues: list[str] = []
-    topics = con.execute("SELECT id,subject,name,practice_only FROM topics WHERE subject IN ('Quant','DILR','VARC') ORDER BY subject,id").fetchall()
+    topics = con.execute(
+        """
+        SELECT topic.id,topic.subject,topic.name,topic.practice_only,
+               MAX(CASE WHEN map.purpose='LEARN' AND resource.id IS NOT NULL
+                         AND access.resource_provider IS NOT NULL THEN 1 ELSE 0 END) AS has_learn,
+               MAX(CASE WHEN map.purpose='PRACTICE' AND resource.id IS NOT NULL
+                         AND access.resource_provider IS NOT NULL THEN 1 ELSE 0 END) AS has_practice,
+               MAX(CASE WHEN map.purpose='PYQ' AND resource.id IS NOT NULL
+                         AND access.resource_provider IS NOT NULL THEN 1 ELSE 0 END) AS has_pyq
+        FROM topics topic
+        LEFT JOIN topic_resource_maps map ON map.topic_id=topic.id
+        LEFT JOIN study_resources resource ON resource.id=map.resource_id AND resource.active=1
+        LEFT JOIN user_resource_access access
+          ON access.resource_provider=resource.provider AND access.enabled=1
+        WHERE topic.subject IN ('Quant','DILR','VARC')
+        GROUP BY topic.id,topic.subject,topic.name,topic.practice_only
+        ORDER BY topic.subject,topic.id
+        """
+    ).fetchall()
     for topic in topics:
-        purposes = {
-            row[0]
-            for row in con.execute(
-                """
-                SELECT DISTINCT trm.purpose FROM topic_resource_maps trm
-                JOIN study_resources sr ON sr.id=trm.resource_id AND sr.active=1
-                JOIN user_resource_access ura ON ura.resource_provider=sr.provider AND ura.enabled=1
-                WHERE trm.topic_id=?
-                """,
-                (topic["id"],),
-            )
-        }
         label = f"{topic['subject']} · {topic['name']}"
-        if not topic["practice_only"] and "LEARN" not in purposes:
+        if not topic["practice_only"] and not topic["has_learn"]:
             issues.append(f"{label}: missing LEARN source")
-        if "PRACTICE" not in purposes:
+        if not topic["has_practice"]:
             issues.append(f"{label}: missing PRACTICE source")
-        if "PYQ" not in purposes:
+        if not topic["has_pyq"]:
             issues.append(f"{label}: missing PYQ fallback")
     gmat = con.execute(
         """

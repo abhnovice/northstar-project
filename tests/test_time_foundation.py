@@ -49,7 +49,8 @@ class TimeFoundationTests(unittest.TestCase):
         self.assertEqual(len(schedule), 63)
         self.assertEqual(len({row["test_id"] for row in schedule}), 63)
         self.assertEqual(len({row["planned_date"] for row in schedule}), 63)
-        self.assertGreaterEqual(schedule[0]["planned_date"], main.current_app_date().isoformat())
+        # Existing schedule dates are durable as the real Kolkata date advances.
+        self.assertGreaterEqual(schedule[0]["planned_date"], main.PREP_START_DATE)
         self.assertLessEqual(schedule[-1]["planned_date"], "2026-11-18")
         aimcat_collision = self.con.execute(
             """SELECT COUNT(*) FROM time_foundation_schedule foundation
