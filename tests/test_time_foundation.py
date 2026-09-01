@@ -4,6 +4,8 @@ import os
 
 os.environ["NORTHSTAR_DATABASE_URL"] = "sqlite"
 
+from fastapi import HTTPException
+
 import main
 
 
@@ -153,6 +155,20 @@ class TimeFoundationTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(signal)
         self.assertIn("concept repair", signal["reason"])
+
+    def test_checkpoint_result_requires_confidence(self):
+        test = self.con.execute(
+            "SELECT * FROM time_foundation_tests WHERE test_reference='OBQ1001806'"
+        ).fetchone()
+        with self.assertRaises(HTTPException) as context:
+            main.record_time_foundation_result(
+                self.con,
+                {
+                    "test_id": test["id"], "attempted_on": "2026-08-20",
+                    "attempted": 10, "correct": 7, "time_spent": 25,
+                },
+            )
+        self.assertIn("Confidence is required", context.exception.detail)
 
     def test_csv_import_upserts_by_test_reference(self):
         before = self.con.execute("SELECT COUNT(*) FROM time_foundation_tests").fetchone()[0]

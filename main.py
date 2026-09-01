@@ -1431,38 +1431,75 @@ def import_time_foundation_csv(con: sqlite3.Connection, content: str) -> dict[st
     return {"created": created, "updated": updated}
 
 
-def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) -> str:
-    """Create one reusable USER resource from Replace Material or Settings."""
-    assignment_id = int(payload.get("assignment_id", 0))
-    assignment = None
-    topic_id = 0
-    if assignment_id:
-        assignment = con.execute(
-            """
-            SELECT assignment.*,task.subject AS task_subject,task.topic AS task_topic,
-                   task.topic_id,task.difficulty,task.date,task.kind,task.aimcat_schedule_id
-            FROM task_resource_assignments assignment
-            JOIN tasks task ON task.id=assignment.task_id
-            WHERE assignment.id=? AND task.archived=0
-            """,
-            (assignment_id,),
-        ).fetchone()
-        if not assignment:
-            raise HTTPException(404, "Task material assignment not found")
-        topic_id = int(assignment["topic_id"] or 0)
-        stage = assignment["stage"]
-        source_subject = assignment["task_subject"]
-        default_difficulty = assignment["difficulty"] or "FOUNDATION"
-    else:
-        topic_id = int(payload.get("topic_id", 0))
-        topic_row = con.execute("SELECT * FROM topics WHERE id=?", (topic_id,)).fetchone()
-        if not topic_row:
+def custom_material_subject(value: Any) -> tuple[str, str]:
+    """Return the UI subject and stored resource subject for one CAT section."""
+    normalized = str(value or "").strip().upper()
+    if normalized in ("QUANT", "QA"):
+        return "Quant", "QA"
+    if normalized in ("DILR", "DI", "LR"):
+        return "DILR", "DILR"
+    if normalized == "VARC":
+        return "VARC", "VARC"
+    raise HTTPException(400, "Choose Quant, DILR or VARC")
+
+
+def custom_material_mapping(
+    con: sqlite3.Connection,
+    payload: dict[str, Any],
+    assignment: sqlite3.Row | None = None,
+    resource: sqlite3.Row | None = None,
+) -> tuple[str, str, list[int], str]:
+    """Resolve topic- or whole-section mappings without adding a schema-only scope flag."""
+    existing_maps = []
+    if resource:
+        existing_maps = con.execute(
+            """SELECT map.*,topic.subject AS topic_subject
+               FROM topic_resource_maps map JOIN topics topic ON topic.id=map.topic_id
+               WHERE map.resource_id=? ORDER BY map.id""",
+            (resource["id"],),
+        ).fetchall()
+    default_scope = "SUBJECT" if len(existing_maps) > 1 else "TOPIC"
+    scope = str(payload.get("mapping_scope") or default_scope).strip().upper()
+    if scope not in ("TOPIC", "SUBJECT"):
+        raise HTTPException(400, "Material scope must be one topic or an entire subject")
+
+    stage = str(
+        payload.get("stage")
+        or (assignment["stage"] if assignment else "")
+        or (existing_maps[0]["purpose"] if existing_maps else "")
+    ).strip().upper()
+    if stage not in ("LEARN", "PRACTICE", "PYQ"):
+        raise HTTPException(400, "Choose Learn, Practice or PYQ")
+
+    if scope == "TOPIC":
+        topic_id = int(
+            payload.get("topic_id", 0)
+            or (assignment["topic_id"] if assignment else 0)
+            or (existing_maps[0]["topic_id"] if existing_maps else 0)
+        )
+        topic = con.execute("SELECT * FROM topics WHERE id=?", (topic_id,)).fetchone()
+        if not topic:
             raise HTTPException(404, "Study topic not found")
-        stage = str(payload.get("stage", "")).strip().upper()
-        if stage not in ("LEARN", "PRACTICE", "PYQ"):
-            raise HTTPException(400, "Choose Learn, Practice or PYQ")
-        source_subject = topic_row["subject"]
-        default_difficulty = topic_row["progression_level"] or "FOUNDATION"
+        display_subject, stored_subject = custom_material_subject(topic["subject"])
+        return display_subject, stored_subject, [topic_id], stage
+
+    source_subject = (
+        payload.get("subject")
+        or (assignment["task_subject"] if assignment else None)
+        or (existing_maps[0]["topic_subject"] if existing_maps else None)
+        or (resource["subject"] if resource else None)
+    )
+    display_subject, stored_subject = custom_material_subject(source_subject)
+    topic_rows = con.execute(
+        "SELECT id FROM topics WHERE subject=? ORDER BY id", (display_subject,)
+    ).fetchall()
+    if not topic_rows:
+        raise HTTPException(400, f"No {display_subject} topics are available to map")
+    return display_subject, stored_subject, [int(row["id"]) for row in topic_rows], stage
+
+
+def custom_material_values(payload: dict[str, Any], default_difficulty: str) -> dict[str, Any]:
+    """Validate the editable fields shared by custom-material create and update."""
     title = str(payload.get("title", "")).strip()
     description = str(payload.get("description", "")).strip()
     url = str(payload.get("url", "")).strip()
@@ -1485,7 +1522,54 @@ def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) 
     access = str(payload.get("access", "FREE")).strip().upper()
     if access not in ("FREE", "SUBSCRIPTION"):
         raise HTTPException(400, "Access must be Free or Subscription")
-    subject = "QA" if source_subject in ("Quant", "QA") else source_subject
+    return {
+        "title": title,
+        "description": description,
+        "url": url or None,
+        "platform_path": platform_path or None,
+        "type": resource_type,
+        "difficulty": difficulty,
+        "free": int(access == "FREE"),
+        "requires_subscription": int(access == "SUBSCRIPTION"),
+    }
+
+
+def map_custom_study_material(
+    con: sqlite3.Connection, resource_id: str, topic_ids: list[int], stage: str
+) -> None:
+    for topic_id in topic_ids:
+        con.execute(
+            """INSERT OR IGNORE INTO topic_resource_maps(topic_id,resource_id,purpose,priority,phase)
+               VALUES(?,?,?,50,'ALL')""",
+            (topic_id, resource_id, stage),
+        )
+
+
+def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) -> str:
+    """Create one reusable USER resource from Replace Material or Settings."""
+    assignment_id = int(payload.get("assignment_id", 0))
+    assignment = None
+    topic_id = 0
+    if assignment_id:
+        assignment = con.execute(
+            """
+            SELECT assignment.*,task.subject AS task_subject,task.topic AS task_topic,
+                   task.topic_id,task.difficulty,task.date,task.kind,task.aimcat_schedule_id
+            FROM task_resource_assignments assignment
+            JOIN tasks task ON task.id=assignment.task_id
+            WHERE assignment.id=? AND task.archived=0
+            """,
+            (assignment_id,),
+        ).fetchone()
+        if not assignment:
+            raise HTTPException(404, "Task material assignment not found")
+        default_difficulty = assignment["difficulty"] or "FOUNDATION"
+    else:
+        topic_id = int(payload.get("topic_id", 0))
+        topic_row = con.execute("SELECT * FROM topics WHERE id=?", (topic_id,)).fetchone() if topic_id else None
+        default_difficulty = topic_row["progression_level"] if topic_row else "FOUNDATION"
+    _, subject, topic_ids, stage = custom_material_mapping(con, payload, assignment=assignment)
+    values = custom_material_values(payload, default_difficulty or "FOUNDATION")
     resource_id = f"user-{uuid.uuid4().hex}"
     con.execute(
         """
@@ -1495,9 +1579,9 @@ def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) 
         ) VALUES(?,'USER',?,?,?,?,?,?,?,?,?,1,?)
         """,
         (
-            resource_id, title, description, subject, resource_type, url or None,
-            platform_path or None, int(access == "FREE"), int(access == "SUBSCRIPTION"),
-            difficulty, current_app_date().isoformat(),
+            resource_id, values["title"], values["description"], subject, values["type"],
+            values["url"], values["platform_path"], values["free"],
+            values["requires_subscription"], values["difficulty"], current_app_date().isoformat(),
         ),
     )
     con.execute(
@@ -1507,14 +1591,7 @@ def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) 
         ON CONFLICT(resource_provider) DO UPDATE SET enabled=1,updated_at=CURRENT_TIMESTAMP
         """
     )
-    if topic_id:
-        con.execute(
-            """
-            INSERT OR IGNORE INTO topic_resource_maps(topic_id,resource_id,purpose,priority,phase)
-            VALUES(?,?,?,50,'ALL')
-            """,
-            (topic_id, resource_id, stage),
-        )
+    map_custom_study_material(con, resource_id, topic_ids, stage)
     if assignment:
         con.execute(
             """
@@ -1526,6 +1603,98 @@ def add_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) 
             (resource_id, assignment_id),
         )
     return resource_id
+
+
+def update_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any]) -> str:
+    """Edit only user-created material while preserving task assignment IDs."""
+    resource_id = str(payload.get("resource_id", "")).strip()
+    resource = con.execute(
+        "SELECT * FROM study_resources WHERE id=? AND provider='USER' AND active=1",
+        (resource_id,),
+    ).fetchone()
+    if not resource:
+        raise HTTPException(404, "Custom study material not found")
+    _, subject, topic_ids, stage = custom_material_mapping(
+        con, payload, resource=resource
+    )
+    values = custom_material_values(payload, resource["difficulty"] or "FOUNDATION")
+    con.execute(
+        """UPDATE study_resources
+           SET title=?,description=?,subject=?,type=?,url=?,platform_path=?,free=?,
+               requires_subscription=?,difficulty=?,last_verified_at=?,updated_at=CURRENT_TIMESTAMP
+           WHERE id=?""",
+        (
+            values["title"], values["description"], subject, values["type"], values["url"],
+            values["platform_path"], values["free"], values["requires_subscription"],
+            values["difficulty"], current_app_date().isoformat(), resource_id,
+        ),
+    )
+    con.execute("DELETE FROM topic_resource_maps WHERE resource_id=?", (resource_id,))
+    map_custom_study_material(con, resource_id, topic_ids, stage)
+    con.execute(
+        """DELETE FROM topic_resource_preferences
+           WHERE resource_id=? AND NOT EXISTS (
+               SELECT 1 FROM topic_resource_maps map
+               WHERE map.resource_id=topic_resource_preferences.resource_id
+                 AND map.topic_id=topic_resource_preferences.topic_id
+                 AND map.purpose=topic_resource_preferences.stage
+           )""",
+        (resource_id,),
+    )
+    return resource_id
+
+
+def delete_custom_study_material(con: sqlite3.Connection, resource_id: str) -> dict[str, int]:
+    """Soft-delete custom material, retaining completed history and repairing future assignments."""
+    resource = con.execute(
+        "SELECT * FROM study_resources WHERE id=? AND provider='USER' AND active=1",
+        (resource_id,),
+    ).fetchone()
+    if not resource:
+        raise HTTPException(404, "Custom study material not found")
+    assignments = con.execute(
+        """SELECT assignment.*,task.completed AS task_completed,task.archived AS task_archived
+           FROM task_resource_assignments assignment
+           JOIN tasks task ON task.id=assignment.task_id
+           WHERE assignment.resource_id=? ORDER BY assignment.id""",
+        (resource_id,),
+    ).fetchall()
+    con.execute(
+        "UPDATE study_resources SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (resource_id,),
+    )
+    con.execute("DELETE FROM topic_resource_maps WHERE resource_id=?", (resource_id,))
+    con.execute("DELETE FROM topic_resource_preferences WHERE resource_id=?", (resource_id,))
+
+    replaced = 0
+    preserved = 0
+    for assignment in assignments:
+        if assignment["task_completed"] or assignment["task_archived"]:
+            preserved += 1
+            continue
+        task_row = con.execute(
+            "SELECT * FROM tasks WHERE id=?", (assignment["task_id"],)
+        ).fetchone()
+        candidates = resource_candidates(con, task_row, assignment["stage"])
+        replacement = next((row for row in candidates if row["id"] != resource_id), None)
+        if replacement:
+            con.execute(
+                """UPDATE task_resource_assignments
+                   SET resource_id=?,manual_override=0,
+                       selected_reason='Automatic fallback after custom material was removed',
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (replacement["id"], assignment["id"]),
+            )
+            replaced += 1
+        else:
+            con.execute("DELETE FROM task_resource_assignments WHERE id=?", (assignment["id"],))
+            assign_task_resources(con, int(assignment["task_id"]))
+            replacement_row = con.execute(
+                "SELECT 1 FROM task_resource_assignments WHERE task_id=? AND stage=?",
+                (assignment["task_id"], assignment["stage"]),
+            ).fetchone()
+            replaced += int(bool(replacement_row))
+    return {"replaced_assignments": replaced, "preserved_history": preserved}
 
 
 def topic_for_time_test(con: sqlite3.Connection, test_row: sqlite3.Row, task_row: sqlite3.Row | None):
@@ -1565,7 +1734,12 @@ def record_time_foundation_result(con: sqlite3.Connection, payload: dict[str, An
     attempted = int(payload.get("attempted", 0))
     correct = int(payload.get("correct", 0))
     time_spent = int(payload.get("time_spent", 0))
-    confidence = int(payload.get("confidence", 3))
+    if payload.get("confidence") in (None, ""):
+        raise HTTPException(400, "Confidence is required because it controls checkpoint progression")
+    try:
+        confidence = int(payload["confidence"])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "Confidence must be a whole number from 1 to 5") from exc
     if attempted <= 0 or correct < 0 or correct > attempted:
         raise HTTPException(400, "Attempted must be positive and correct cannot exceed attempted")
     if time_spent < 0 or not 1 <= confidence <= 5:
@@ -2532,7 +2706,7 @@ def replace_task_resource(
     con,
     assignment_id: int,
     resource_id: str,
-    prefer_for_topic: bool = False,
+    preference_scope: str | bool = "TASK",
 ) -> None:
     assignment = con.execute(
         "SELECT * FROM task_resource_assignments WHERE id=?",
@@ -2549,6 +2723,14 @@ def replace_task_resource(
     task_row = con.execute("SELECT * FROM tasks WHERE id=?", (assignment["task_id"],)).fetchone()
     if not candidate:
         raise HTTPException(400, "Replacement must be an enabled, available resource")
+    if isinstance(preference_scope, bool):
+        scope = "TOPIC" if preference_scope else "TASK"
+    else:
+        scope = str(preference_scope or "TASK").strip().upper()
+    if scope not in ("TASK", "TOPIC", "SUBJECT"):
+        raise HTTPException(400, "Material preference must apply to this task, topic or subject")
+    if scope == "SUBJECT" and candidate["type"] == "FOUNDATION_TEST":
+        raise HTTPException(400, "A specific foundation test cannot replace an entire subject")
     con.execute(
         """UPDATE task_resource_assignments
            SET resource_id=?,manual_override=1,selected_reason='Selected with Replace Material',updated_at=CURRENT_TIMESTAMP
@@ -2565,19 +2747,41 @@ def replace_task_resource(
                 "UPDATE tasks SET time_foundation_test_id=? WHERE id=?",
                 (checkpoint["id"], task_row["id"]),
             )
-    if prefer_for_topic and task_row["topic_id"]:
+    topic_ids: list[int] = []
+    if scope == "TOPIC" and task_row["topic_id"]:
+        topic_ids = [int(task_row["topic_id"])]
+    elif scope == "SUBJECT":
+        display_subject, _ = custom_material_subject(task_row["subject"])
+        topic_ids = [
+            int(row["id"])
+            for row in con.execute(
+                "SELECT id FROM topics WHERE subject=? ORDER BY id", (display_subject,)
+            ).fetchall()
+        ]
+    for topic_id in topic_ids:
         con.execute(
             """INSERT INTO topic_resource_maps(topic_id,resource_id,purpose,priority,phase)
                VALUES(?,?,?,1,'ALL')
                ON CONFLICT(topic_id,resource_id,purpose,phase) DO UPDATE SET priority=1""",
-            (task_row["topic_id"], resource_id, assignment["stage"]),
+            (topic_id, resource_id, assignment["stage"]),
         )
         con.execute(
             """INSERT INTO topic_resource_preferences(topic_id,stage,resource_id,provider)
                VALUES(?,?,?,?)
                ON CONFLICT(topic_id,stage) DO UPDATE SET
                    resource_id=excluded.resource_id,provider=excluded.provider,updated_at=CURRENT_TIMESTAMP""",
-            (task_row["topic_id"], assignment["stage"], resource_id, candidate["provider"]),
+            (topic_id, assignment["stage"], resource_id, candidate["provider"]),
+        )
+    if scope == "SUBJECT":
+        con.execute(
+            """UPDATE task_resource_assignments
+               SET resource_id=?,selected_reason='Applied from subject-wide material preference',
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE manual_override=0 AND completed=0 AND stage=? AND task_id IN (
+                   SELECT id FROM tasks
+                   WHERE subject=? AND completed=0 AND archived=0 AND date>=?
+               )""",
+            (resource_id, assignment["stage"], task_row["subject"], task_row["date"]),
         )
 
 
@@ -2728,6 +2932,12 @@ def api_action(body: Action):
             import_time_foundation_csv(con, str(p.get("csv", "")))
         elif action == "addCustomStudyMaterial":
             add_custom_study_material(con, p)
+        elif action == "updateCustomStudyMaterial":
+            update_custom_study_material(con, p)
+        elif action == "deleteCustomStudyMaterial":
+            action_result = delete_custom_study_material(
+                con, str(p.get("resource_id", "")).strip()
+            )
         elif action == "addError":
             if str(p.get("subject", "")) == "VARC":
                 p["error_type"] = normalize_varc_error(str(p.get("error_type", "OTHER")))
@@ -2739,6 +2949,14 @@ def api_action(body: Action):
             p.update(manual=1,kind="manual",completed=0,completion=0,actual_duration=0)
             insert_task(con,p)
         elif action == "updateTopic":
+            if p.get("confidence") in (None, ""):
+                raise HTTPException(400, "Confidence is required when updating topic mastery")
+            try:
+                p["confidence"] = int(p["confidence"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "Confidence must be a whole number from 1 to 5") from exc
+            if not 1 <= p["confidence"] <= 5:
+                raise HTTPException(400, "Confidence must be between 1 and 5")
             con.execute("UPDATE topics SET status=?,confidence=?,accuracy=?,attempted=?,correct=?,last_practised=?,next_revision=? WHERE id=?", tuple(p.get(k) for k in ["status","confidence","accuracy","attempted","correct","last_practised","next_revision","id"]))
         elif action == "updateDeadline": con.execute("UPDATE deadlines SET title=?,date=?,status=?,note=? WHERE id=?", tuple(p.get(k) for k in ["title","date","status","note","id"]))
         elif action == "settings":
@@ -2786,7 +3004,7 @@ def api_action(body: Action):
                 con,
                 int(p.get("assignment_id", 0)),
                 str(p.get("resource_id", "")),
-                bool(p.get("prefer_for_topic")),
+                str(p.get("preference_scope") or ("TOPIC" if p.get("prefer_for_topic") else "TASK")),
             )
         elif action == "rescheduleTask":
             action_result = reschedule_task(
@@ -2809,7 +3027,12 @@ def api_action(body: Action):
             attempted = int(p.get("attempted", 0))
             correct = int(p.get("correct", 0))
             time_spent = int(p.get("time_spent", 0))
-            confidence = int(p.get("confidence", 3))
+            if p.get("confidence") in (None, ""):
+                raise HTTPException(400, "Confidence is required because it drives mastery and future material")
+            try:
+                confidence = int(p["confidence"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "Confidence must be a whole number from 1 to 5") from exc
             notes = str(p.get("notes", ""))
             task_row = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task_row:

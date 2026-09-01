@@ -248,6 +248,22 @@ class CommandCenterTests(unittest.TestCase):
                         tuple(original_result[column] for column in columns),
                     )
 
+    def test_practice_result_requires_confidence(self):
+        data = self.client.get("/api/app?date=2026-08-12").json()
+        task = next(task for task in data["tasks"] if task["kind"] == "practice")
+        response = self.client.post(
+            "/api/app",
+            json={
+                "action": "completeTaskWithResult",
+                "payload": {
+                    "task_id": task["id"], "attempted": 10,
+                    "correct": 7, "time_spent": 30,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Confidence is required", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

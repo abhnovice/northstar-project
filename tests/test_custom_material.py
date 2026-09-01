@@ -120,6 +120,39 @@ class CustomStudyMaterialTests(unittest.TestCase):
                 {"assignment_id": self.assignment["id"], "title": "No location"},
             )
 
+    def test_replace_material_can_prefer_one_resource_for_entire_subject(self):
+        task = self.con.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.assignment["task_id"],)
+        ).fetchone()
+        alternative = next(
+            row for row in main.resource_candidates(self.con, task, "PRACTICE")
+            if row["id"] != self.assignment["resource_id"]
+        )
+        main.replace_task_resource(
+            self.con, self.assignment["id"], alternative["id"], "SUBJECT"
+        )
+        quant_topics = self.con.execute(
+            "SELECT * FROM topics WHERE subject='Quant' ORDER BY id"
+        ).fetchall()
+        preferences = self.con.execute(
+            """SELECT * FROM topic_resource_preferences
+               WHERE stage='PRACTICE' AND resource_id=?""",
+            (alternative["id"],),
+        ).fetchall()
+        self.assertEqual(
+            {row["topic_id"] for row in preferences}, {row["id"] for row in quant_topics}
+        )
+        other_topic = next(row for row in quant_topics if row["id"] != task["topic_id"])
+        other_task = dict(task)
+        other_task["topic_id"] = other_topic["id"]
+        other_task["topic"] = other_topic["name"]
+        ranked = main.resource_candidates(self.con, other_task, "PRACTICE")
+        self.assertEqual(ranked[0]["id"], alternative["id"])
+        selected = self.con.execute(
+            "SELECT * FROM task_resource_assignments WHERE id=?", (self.assignment["id"],)
+        ).fetchone()
+        self.assertTrue(selected["manual_override"])
+
     def test_settings_material_appears_in_replace_candidates(self):
         topic = self.con.execute(
             "SELECT * FROM topics WHERE subject='Quant' ORDER BY id LIMIT 1"
@@ -172,6 +205,110 @@ class CustomStudyMaterialTests(unittest.TestCase):
                     "stage": "PRACTICE",
                 },
             )
+
+    def test_subject_wide_material_maps_every_quant_topic_and_can_be_edited(self):
+        resource_id = main.add_custom_study_material(
+            self.con,
+            {
+                "mapping_scope": "SUBJECT",
+                "subject": "Quant",
+                "stage": "PRACTICE",
+                "title": "Complete Quant practice bank",
+                "url": "https://example.com/quant",
+                "type": "QUESTION_BANK",
+                "access": "FREE",
+                "difficulty": "INTERMEDIATE",
+            },
+        )
+        quant_topics = self.con.execute(
+            "SELECT id FROM topics WHERE subject='Quant' ORDER BY id"
+        ).fetchall()
+        mappings = self.con.execute(
+            "SELECT * FROM topic_resource_maps WHERE resource_id=? ORDER BY topic_id",
+            (resource_id,),
+        ).fetchall()
+        self.assertEqual(
+            {row["topic_id"] for row in mappings}, {row["id"] for row in quant_topics}
+        )
+        self.assertTrue(all(row["purpose"] == "PRACTICE" for row in mappings))
+
+        main.update_custom_study_material(
+            self.con,
+            {
+                "resource_id": resource_id,
+                "mapping_scope": "SUBJECT",
+                "subject": "DILR",
+                "stage": "LEARN",
+                "title": "Complete DILR learning course",
+                "platform_path": "My portal → DILR",
+                "type": "COURSE",
+                "access": "SUBSCRIPTION",
+                "difficulty": "FOUNDATION",
+            },
+        )
+        changed = self.con.execute(
+            "SELECT * FROM study_resources WHERE id=?", (resource_id,)
+        ).fetchone()
+        changed_mappings = self.con.execute(
+            """SELECT map.*,topic.subject FROM topic_resource_maps map
+               JOIN topics topic ON topic.id=map.topic_id WHERE map.resource_id=?""",
+            (resource_id,),
+        ).fetchall()
+        self.assertEqual(changed["title"], "Complete DILR learning course")
+        self.assertEqual(changed["subject"], "DILR")
+        self.assertTrue(changed["requires_subscription"])
+        self.assertTrue(changed_mappings)
+        self.assertTrue(all(row["subject"] == "DILR" for row in changed_mappings))
+        self.assertTrue(all(row["purpose"] == "LEARN" for row in changed_mappings))
+
+    def test_delete_custom_material_replaces_unfinished_assignment(self):
+        resource_id = main.add_custom_study_material(
+            self.con,
+            {
+                "assignment_id": self.assignment["id"],
+                "title": "Temporary practice bank",
+                "url": "https://example.com/temporary",
+                "type": "QUESTION_BANK",
+                "access": "FREE",
+                "difficulty": "FOUNDATION",
+            },
+        )
+        result = main.delete_custom_study_material(self.con, resource_id)
+        resource = self.con.execute(
+            "SELECT * FROM study_resources WHERE id=?", (resource_id,)
+        ).fetchone()
+        changed = self.con.execute(
+            "SELECT * FROM task_resource_assignments WHERE id=?", (self.assignment["id"],)
+        ).fetchone()
+        self.assertFalse(resource["active"])
+        self.assertNotEqual(changed["resource_id"], resource_id)
+        self.assertFalse(changed["manual_override"])
+        self.assertEqual(result["replaced_assignments"], 1)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM topic_resource_maps WHERE resource_id=?", (resource_id,)
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_delete_custom_material_preserves_completed_task_history(self):
+        resource_id = main.add_custom_study_material(
+            self.con,
+            {
+                "assignment_id": self.assignment["id"],
+                "title": "Completed historical worksheet",
+                "url": "https://example.com/history",
+            },
+        )
+        self.con.execute(
+            "UPDATE tasks SET completed=1 WHERE id=?", (self.assignment["task_id"],)
+        )
+        result = main.delete_custom_study_material(self.con, resource_id)
+        historical = self.con.execute(
+            "SELECT * FROM task_resource_assignments WHERE id=?", (self.assignment["id"],)
+        ).fetchone()
+        self.assertEqual(historical["resource_id"], resource_id)
+        self.assertEqual(result["preserved_history"], 1)
 
 
 if __name__ == "__main__":
