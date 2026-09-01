@@ -1647,11 +1647,14 @@ def update_custom_study_material(con: sqlite3.Connection, payload: dict[str, Any
 def delete_custom_study_material(con: sqlite3.Connection, resource_id: str) -> dict[str, int]:
     """Soft-delete custom material, retaining completed history and repairing future assignments."""
     resource = con.execute(
-        "SELECT * FROM study_resources WHERE id=? AND provider='USER' AND active=1",
+        "SELECT * FROM study_resources WHERE id=? AND provider='USER'",
         (resource_id,),
     ).fetchone()
     if not resource:
         raise HTTPException(404, "Custom study material not found")
+    if not resource["active"]:
+        # DELETE is intentionally idempotent so stale clients can safely retry and refresh.
+        return {"replaced_assignments": 0, "preserved_history": 0, "already_deleted": 1}
     assignments = con.execute(
         """SELECT assignment.*,task.completed AS task_completed,task.archived AS task_archived
            FROM task_resource_assignments assignment
@@ -2827,7 +2830,7 @@ def get_data(day: str) -> dict[str, Any]:
             "deadlines": deadlines, "mocks": mocks, "aimcats": aimcats,
             "aimcatMeta": aimcat_meta, "aimcatTrend": aimcat_trend, "errors": errors,
             "resources": rows(con, "SELECT * FROM resources ORDER BY recommended DESC,id"),
-            "studyResources": rows(con, "SELECT * FROM study_resources ORDER BY free DESC,provider,title"),
+            "studyResources": rows(con, "SELECT * FROM study_resources WHERE active=1 ORDER BY free DESC,provider,title"),
             "resourceCatalogue": catalogue,
             "resourceAccess": rows(con, "SELECT * FROM user_resource_access ORDER BY enabled DESC,resource_provider"),
             "topicResourceMaps": rows(con, "SELECT * FROM topic_resource_maps ORDER BY topic_id,purpose,priority"),

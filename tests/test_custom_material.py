@@ -290,6 +290,8 @@ class CustomStudyMaterialTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+        repeated = main.delete_custom_study_material(self.con, resource_id)
+        self.assertEqual(repeated["already_deleted"], 1)
 
     def test_delete_custom_material_preserves_completed_task_history(self):
         resource_id = main.add_custom_study_material(
